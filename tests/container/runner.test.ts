@@ -7,7 +7,7 @@ import path from 'node:path';
 import { runContainerSession, type ContainerSessionDeps } from '../../src/container-agent/runner.ts';
 import { migrate } from '../../src/db/migrate.ts';
 import { openInboundDb, writeInboundMessage } from '../../src/session/inbound.ts';
-import { openOutboundDb, readProcessingAck } from '../../src/session/outbound.ts';
+import { openOutboundDb, readProcessingAck, writeProcessingAck } from '../../src/session/outbound.ts';
 import type { SessionConfig } from '../../src/shared/types.ts';
 
 const tempDirs: string[] = [];
@@ -545,5 +545,59 @@ describe('container runner phase 5', () => {
         }),
       },
     ]);
+  });
+
+  it('uses the larger outbound seq candidate from the persisted ack and inbound seq', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-outseq-');
+    const sessionId = 'sess-outseq-1';
+    const outboundDb = openOutboundDb(sessionDir);
+
+    try {
+      writeProcessingAck(outboundDb, {
+        session_id: sessionId,
+        last_in_seq: 2,
+        last_out_seq: 7,
+        heartbeat_at: '2026-01-01T00:00:00.000Z',
+      });
+    } finally {
+      outboundDb.close();
+    }
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, 'Skipped while ack was ahead.');
+    writeUserMessage(sessionDir, 'Process the next inbound message.');
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createFakeDeps({
+        responseText: 'Runner kept the higher odd outbound seq',
+      }),
+    );
+
+    expect(response).toBe('Runner kept the higher odd outbound seq');
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 9,
+        content: 'Runner kept the higher odd outbound seq',
+        metadata: null,
+      },
+    ]);
+    expect(readAck(sessionDir, sessionId)).toMatchObject({
+      session_id: sessionId,
+      last_in_seq: 4,
+      last_out_seq: 9,
+    });
   });
 });

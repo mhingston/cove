@@ -2,6 +2,7 @@ import type { Database } from 'bun:sqlite';
 
 import { adoptRunningContainer as defaultAdoptRunningContainer } from '../container/adopt.ts';
 import { killContainer as defaultKillContainer } from '../container/kill.ts';
+import { loadPersona } from '../context/persona.ts';
 import {
   getActiveContainers,
   isContainerRunning as defaultIsContainerRunning,
@@ -29,6 +30,23 @@ type EnsureSessionRuntimeDeps = {
   spawnContainer?(options: ContainerStartOptions): boolean;
   killContainer?(sessionId: string, reason?: string): void;
 };
+
+function injectPersonaIntoConfig(config: SessionConfig, agentGroupId: string, db: Database): SessionConfig {
+  const explicitPersona = config.extra_env?.COVE_PERSONA;
+  const persona = explicitPersona ?? loadPersona(agentGroupId, { db });
+
+  if (persona == null) {
+    return config;
+  }
+
+  return {
+    ...config,
+    extra_env: {
+      ...(config.extra_env ?? {}),
+      COVE_PERSONA: persona,
+    },
+  };
+}
 
 function buildRuntimeEnv(config: SessionConfig, sessionId: string): Record<string, string> {
   return {
@@ -73,6 +91,7 @@ export function createEnsureSessionRuntime(deps: EnsureSessionRuntimeDeps) {
 
   return async function ensureSessionRuntime(options: EnsureSessionRuntimeOptions): Promise<boolean> {
     const liveSessionId = options.routed.session.id;
+    const resolvedConfig = injectPersonaIntoConfig(options.config, options.routed.agentGroup.id, deps.db);
 
     if (isContainerRunning(liveSessionId)) {
       return true;
@@ -88,7 +107,7 @@ export function createEnsureSessionRuntime(deps: EnsureSessionRuntimeDeps) {
         sessionDir: warmAllocation.sessionDir,
         envVars: buildAdoptedRuntimeEnv({
           warmSessionId: warmAllocation.sessionId,
-          config: options.config,
+          config: resolvedConfig,
           liveSessionId,
         }),
       });
@@ -124,6 +143,9 @@ export function createEnsureSessionRuntime(deps: EnsureSessionRuntimeDeps) {
       return false;
     }
 
-    return spawnContainer(buildColdSpawnOptions(deps, options));
+    return spawnContainer(buildColdSpawnOptions(deps, {
+      ...options,
+      config: resolvedConfig,
+    }));
   };
 }

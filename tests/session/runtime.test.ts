@@ -87,6 +87,14 @@ function readSessionFile(sessionId: string): string | null {
   return row.session_file;
 }
 
+function readAgentGroupSoul(agentGroupId: string): string | null {
+  const row = db!
+    .prepare('SELECT soul FROM agent_groups WHERE id = ?')
+    .get(agentGroupId) as { soul: string | null };
+
+  return row.soul;
+}
+
 function makeWarmPool(overrides: Partial<WarmPool> & {
   acquire?: WarmPool['acquire'];
 } = {}): WarmPool {
@@ -359,6 +367,101 @@ describe('session runtime manager', () => {
     });
   });
 
+  it('overrides any stale warm-container persona with the explicit config persona during adoption', async () => {
+    const stateDir = makeStateDir();
+    const warmSessionDir = path.join(stateDir, 'warm', 'warm-persona-explicit');
+
+    db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup('support');
+    db.prepare('UPDATE agent_groups SET soul = ? WHERE id = ?').run('db persona', 'support');
+
+    const routed = makeRoutedRequest({ stateDir, sessionDir: path.join(stateDir, 'sessions', 'support', 'live-session') });
+    insertSession(routed);
+    trackContainer('warm-persona-explicit', {
+      containerName: 'cove-warm-warm-persona-explicit',
+      sessionDir: warmSessionDir,
+      envVars: { WARM_ONLY: 'true', COVE_PERSONA: 'stale warm persona' },
+    });
+
+    const ensureSessionRuntime = createEnsureSessionRuntime({
+      db,
+      warmPool: makeWarmPool({
+        acquire: async () => ({
+          sessionId: 'warm-persona-explicit',
+          containerName: 'cove-warm-warm-persona-explicit',
+          sessionDir: warmSessionDir,
+        }),
+      }),
+      imageName: 'cove-agent:latest',
+      centralDbPath: '/tmp/cove.db',
+    });
+
+    const config = makeConfig({
+      extra_env: {
+        EXTRA_FLAG: '1',
+        COVE_PERSONA: 'explicit persona',
+      },
+    });
+
+    const ready = await ensureSessionRuntime({ routed, config });
+
+    expect(ready).toBe(true);
+    expect(getActiveContainers().get(routed.session.id)?.options.envVars).toMatchObject({
+      WARM_ONLY: 'true',
+      EXTRA_FLAG: '1',
+      COVE_PERSONA: 'explicit persona',
+      COVE_SESSION_ID: routed.session.id,
+    });
+  });
+
+  it('overrides any stale warm-container persona with the loaded host persona during adoption', async () => {
+    const stateDir = makeStateDir();
+    const warmSessionDir = path.join(stateDir, 'warm', 'warm-persona-loaded');
+
+    db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup('support');
+    db.prepare('UPDATE agent_groups SET soul = ? WHERE id = ?').run('db persona', 'support');
+
+    const routed = makeRoutedRequest({ stateDir, sessionDir: path.join(stateDir, 'sessions', 'support', 'live-session') });
+    insertSession(routed);
+    trackContainer('warm-persona-loaded', {
+      containerName: 'cove-warm-warm-persona-loaded',
+      sessionDir: warmSessionDir,
+      envVars: { WARM_ONLY: 'true', COVE_PERSONA: 'stale warm persona' },
+    });
+
+    const ensureSessionRuntime = createEnsureSessionRuntime({
+      db,
+      warmPool: makeWarmPool({
+        acquire: async () => ({
+          sessionId: 'warm-persona-loaded',
+          containerName: 'cove-warm-warm-persona-loaded',
+          sessionDir: warmSessionDir,
+        }),
+      }),
+      imageName: 'cove-agent:latest',
+      centralDbPath: '/tmp/cove.db',
+    });
+
+    const config = makeConfig({
+      extra_env: {
+        EXTRA_FLAG: '1',
+      },
+    });
+
+    const ready = await ensureSessionRuntime({ routed, config });
+
+    expect(ready).toBe(true);
+    expect(getActiveContainers().get(routed.session.id)?.options.envVars).toMatchObject({
+      WARM_ONLY: 'true',
+      EXTRA_FLAG: '1',
+      COVE_PERSONA: 'db persona',
+      COVE_SESSION_ID: routed.session.id,
+    });
+  });
+
   it('releases the warm entry and falls back to cold spawn when adoption fails', async () => {
     const stateDir = makeStateDir();
     const warmSessionDir = path.join(stateDir, 'warm', 'warm-2');
@@ -444,6 +547,97 @@ describe('session runtime manager', () => {
         COVE_SESSION_ID: routed.session.id,
       },
     });
+  });
+
+  it('injects loaded persona into config extra_env and preserves existing values for cold spawn', async () => {
+    const stateDir = makeStateDir();
+    const coldSessionDir = path.join(stateDir, 'sessions', 'support', 'live-session');
+
+    db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup('support');
+    db.prepare('UPDATE agent_groups SET soul = ? WHERE id = ?').run('db persona', 'support');
+
+    const routed = makeRoutedRequest({ stateDir, sessionDir: coldSessionDir });
+    insertSession(routed);
+
+    const spawnContainer = mock(() => true);
+    const config = makeConfig({ extra_env: { EXTRA_FLAG: 'kept' } });
+    const ensureSessionRuntime = createEnsureSessionRuntime({
+      db,
+      warmPool: makeWarmPool(),
+      imageName: 'cove-agent:latest',
+      centralDbPath: '/tmp/cove.db',
+      spawnContainer,
+    });
+
+    const ready = await ensureSessionRuntime({
+      routed,
+      config,
+    });
+
+    expect(ready).toBe(true);
+    expect(config.extra_env).toEqual({ EXTRA_FLAG: 'kept' });
+    expect(spawnContainer).toHaveBeenCalledWith({
+      imageName: 'cove-agent:latest',
+      containerName: routed.session.id,
+      sessionId: routed.session.id,
+      sessionDir: coldSessionDir,
+      centralDbPath: '/tmp/cove.db',
+      workspaceDir: '/workspace/support',
+      envVars: {
+        EXTRA_FLAG: 'kept',
+        COVE_PERSONA: 'db persona',
+        COVE_SESSION_ID: routed.session.id,
+      },
+    });
+    expect(readAgentGroupSoul('support')).toBe('db persona');
+  });
+
+  it('keeps an explicit config extra_env COVE_PERSONA instead of loading from the database', async () => {
+    const stateDir = makeStateDir();
+    const coldSessionDir = path.join(stateDir, 'sessions', 'support', 'live-session');
+
+    db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup('support');
+    db.prepare('UPDATE agent_groups SET soul = ? WHERE id = ?').run('db persona', 'support');
+
+    const routed = makeRoutedRequest({ stateDir, sessionDir: coldSessionDir });
+    insertSession(routed);
+
+    const spawnContainer = mock(() => true);
+    const config = makeConfig({
+      extra_env: {
+        EXTRA_FLAG: 'kept',
+        COVE_PERSONA: 'explicit persona',
+      },
+    });
+    const ensureSessionRuntime = createEnsureSessionRuntime({
+      db,
+      warmPool: makeWarmPool(),
+      imageName: 'cove-agent:latest',
+      centralDbPath: '/tmp/cove.db',
+      spawnContainer,
+    });
+
+    const ready = await ensureSessionRuntime({
+      routed,
+      config,
+    });
+
+    expect(ready).toBe(true);
+    expect(config.extra_env).toEqual({
+      EXTRA_FLAG: 'kept',
+      COVE_PERSONA: 'explicit persona',
+    });
+    expect(spawnContainer).toHaveBeenCalledWith(expect.objectContaining({
+      envVars: {
+        EXTRA_FLAG: 'kept',
+        COVE_PERSONA: 'explicit persona',
+        COVE_SESSION_ID: routed.session.id,
+      },
+    }));
   });
 
   it('kills and untracks the adopted live container, restores session_file, consumes the warm slot, and returns false when the post-adoption DB update fails', async () => {

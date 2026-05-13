@@ -55,6 +55,29 @@ afterEach(() => {
   }
 });
 
+function readPersistedExtraEnv(sessionDir: string): Record<string, string> {
+  const inboundDb = new Database(path.join(sessionDir, 'inbound.db'));
+
+  try {
+    const row = inboundDb.prepare('SELECT extra_env FROM session_config').get() as {
+      extra_env: string | null;
+    };
+
+    return JSON.parse(row.extra_env ?? '{}') as Record<string, string>;
+  } finally {
+    inboundDb.close();
+  }
+}
+
+function readWorkingJsonl(sessionDir: string): Array<Record<string, unknown>> {
+  return fs
+    .readFileSync(path.join(sessionDir, 'working.jsonl'), 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
 describe('streamDirectSessionTokens', () => {
   it('writes merged session input and yields live tokens from the direct runner path', async () => {
     const stateDir = makeStateDir();
@@ -138,6 +161,201 @@ describe('streamDirectSessionTokens', () => {
 
       expect(tokens).toEqual(['relay', ' stream']);
       expect(runnerCalled).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('writes request messages to working.jsonl beside the session databases in the direct-stream path', async () => {
+    const stateDir = makeStateDir();
+    const db = new Database(':memory:');
+    migrate(db);
+
+    const routing = makeRoutingResult(stateDir, { sessionId: 'sess-stream-working-jsonl' });
+
+    try {
+      for await (const _token of streamDirectSessionTokens(
+        {
+          centralDb: db,
+          routing,
+          config: {
+            provider: 'anthropic',
+            model: 'claude-request',
+          },
+          messages: [
+            { role: 'system', content: 'You are helpful' },
+            { role: 'assistant', content: 'Previous reply' },
+            { role: 'user', content: 'Next question' },
+          ],
+        },
+        {
+          runContainerSession: async (_options, _onResponse, _deps, onToken) => {
+            onToken?.('ok');
+            return 'ok';
+          },
+        },
+      )) {
+        // consume stream
+      }
+
+      const sessionDir = routing.session.session_file!;
+      const inboundFile = path.join(sessionDir, 'inbound.db');
+      const outboundFile = path.join(sessionDir, 'outbound.db');
+      const workingFile = path.join(sessionDir, 'working.jsonl');
+      const workingEntries = readWorkingJsonl(sessionDir);
+
+      expect(path.dirname(inboundFile)).toBe(sessionDir);
+      expect(path.dirname(outboundFile)).toBe(sessionDir);
+      expect(path.dirname(workingFile)).toBe(sessionDir);
+      expect(path.relative(inboundFile, workingFile)).toBe('../working.jsonl');
+      expect(path.relative(outboundFile, workingFile)).toBe('../working.jsonl');
+      expect(fs.existsSync(inboundFile)).toBe(true);
+      expect(fs.existsSync(outboundFile)).toBe(true);
+      expect(fs.existsSync(workingFile)).toBe(true);
+      expect(workingEntries).toHaveLength(4);
+      expect(workingEntries[0]).toMatchObject({
+        type: 'session',
+        id: 'sess-stream-working-jsonl',
+        version: 3,
+      });
+      expect(workingEntries.slice(1)).toEqual([
+        {
+          type: 'message',
+          id: expect.any(String),
+          parentId: null,
+          timestamp: expect.any(String),
+          message: { role: 'system', content: 'You are helpful' },
+        },
+        {
+          type: 'message',
+          id: expect.any(String),
+          parentId: null,
+          timestamp: expect.any(String),
+          message: { role: 'assistant', content: 'Previous reply' },
+        },
+        {
+          type: 'message',
+          id: expect.any(String),
+          parentId: null,
+          timestamp: expect.any(String),
+          message: { role: 'user', content: 'Next question' },
+        },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('persists loaded persona into session_config extra_env before running the direct runner', async () => {
+    const stateDir = makeStateDir();
+    const db = new Database(':memory:');
+    migrate(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, workspace, provider, model, thinking, permissions, soul, config, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'stream-group',
+      'Stream Group',
+      '/workspace/from-group',
+      'anthropic',
+      'claude-group',
+      'medium',
+      '{"default":"ask"}',
+      'db persona',
+      null,
+      '2026-01-01T00:00:00.000Z',
+      '2026-01-01T00:00:00.000Z',
+    );
+
+    const routing = makeRoutingResult(stateDir);
+
+    try {
+      for await (const _token of streamDirectSessionTokens(
+        {
+          centralDb: db,
+          routing,
+          config: {
+            provider: 'anthropic',
+            model: 'claude-request',
+            extra_env: { EXTRA_FLAG: 'kept' },
+          },
+          messages: [{ role: 'user', content: 'Hello stream' }],
+        },
+        {
+          runContainerSession: async (_options, _onResponse, _deps, onToken) => {
+            onToken?.('ok');
+            return 'ok';
+          },
+        },
+      )) {
+        // consume stream
+      }
+
+      expect(readPersistedExtraEnv(routing.session.session_file!)).toEqual({
+        EXTRA_FLAG: 'kept',
+        COVE_PERSONA: 'db persona',
+        COVE_AGENT_GROUP_ID: 'stream-group',
+        COVE_CENTRAL_DB_PATH: '/app/session/cove.db',
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('preserves an explicit config extra_env COVE_PERSONA over database lookup in persisted session_config', async () => {
+    const stateDir = makeStateDir();
+    const db = new Database(':memory:');
+    migrate(db);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, workspace, provider, model, thinking, permissions, soul, config, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'stream-group',
+      'Stream Group',
+      '/workspace/from-group',
+      'anthropic',
+      'claude-group',
+      'medium',
+      '{"default":"ask"}',
+      'db persona',
+      null,
+      '2026-01-01T00:00:00.000Z',
+      '2026-01-01T00:00:00.000Z',
+    );
+
+    const routing = makeRoutingResult(stateDir, { sessionId: 'sess-stream-explicit-persona' });
+
+    try {
+      for await (const _token of streamDirectSessionTokens(
+        {
+          centralDb: db,
+          routing,
+          config: {
+            provider: 'anthropic',
+            model: 'claude-request',
+            extra_env: {
+              EXTRA_FLAG: 'kept',
+              COVE_PERSONA: 'explicit persona',
+            },
+          },
+          messages: [{ role: 'user', content: 'Hello stream' }],
+        },
+        {
+          runContainerSession: async (_options, _onResponse, _deps, onToken) => {
+            onToken?.('ok');
+            return 'ok';
+          },
+        },
+      )) {
+        // consume stream
+      }
+
+      expect(readPersistedExtraEnv(routing.session.session_file!)).toEqual({
+        EXTRA_FLAG: 'kept',
+        COVE_PERSONA: 'explicit persona',
+        COVE_AGENT_GROUP_ID: 'stream-group',
+        COVE_CENTRAL_DB_PATH: '/app/session/cove.db',
+      });
     } finally {
       db.close();
     }

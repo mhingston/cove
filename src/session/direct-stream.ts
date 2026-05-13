@@ -5,6 +5,7 @@ import {
   runContainerSession as runContainerSessionDefault,
   type ContainerSessionDeps,
 } from '../container-agent/runner.ts';
+import { loadPersona } from '../context/persona.ts';
 import { appendWorkingMessage, ensureWorkingSession } from '../context/working.ts';
 import { initSessionFolder } from './manager.ts';
 import { openInboundDb, writeInboundMessage } from './inbound.ts';
@@ -57,6 +58,23 @@ function writeSessionConfig(db: Database, config: SessionConfig): void {
     config.extra_env == null ? null : JSON.stringify(config.extra_env),
     config.permissions ?? null,
   );
+}
+
+function mergePersonaIntoConfig(config: SessionConfig, agentGroupId: string, db: Database): SessionConfig {
+  const explicitPersona = config.extra_env?.COVE_PERSONA;
+  const persona = explicitPersona ?? loadPersona(agentGroupId, { db });
+
+  if (persona == null) {
+    return config;
+  }
+
+  return {
+    ...config,
+    extra_env: {
+      ...(config.extra_env ?? {}),
+      COVE_PERSONA: persona,
+    },
+  };
 }
 
 function streamQueue<T>() {
@@ -137,10 +155,16 @@ export async function* streamDirectSessionTokens(
   initSessionFolder(sessionDir);
   ensureWorkingSession(sessionDir, request.routing.session.id);
 
+  const configWithPersona = mergePersonaIntoConfig(
+    request.config,
+    request.routing.agentGroup.id,
+    request.centralDb,
+  );
+
   const mergedConfig: SessionConfig = {
-    ...request.config,
+    ...configWithPersona,
     extra_env: {
-      ...(request.config.extra_env ?? {}),
+      ...(configWithPersona.extra_env ?? {}),
       COVE_AGENT_GROUP_ID: request.routing.agentGroup.id,
       COVE_CENTRAL_DB_PATH: '/app/session/cove.db',
     },

@@ -9,6 +9,25 @@ function ensureDir(filePath: string): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
 
+function createSessionHeader(sessionId: string): string {
+  return JSON.stringify({
+    type: 'session',
+    id: sessionId,
+    timestamp: new Date().toISOString(),
+    version: 3,
+  });
+}
+
+function createMessageLine(role: string, content: string): string {
+  return JSON.stringify({
+    type: 'message',
+    id: crypto.randomUUID(),
+    parentId: null,
+    timestamp: new Date().toISOString(),
+    message: { role, content },
+  });
+}
+
 export function ensureWorkingSession(sessionDir: string, sessionId: string): string {
   const filePath = workingFilePath(sessionDir);
 
@@ -17,16 +36,7 @@ export function ensureWorkingSession(sessionDir: string, sessionId: string): str
   }
 
   ensureDir(filePath);
-  fs.writeFileSync(
-    filePath,
-    `${JSON.stringify({
-      type: 'session',
-      id: sessionId,
-      timestamp: new Date().toISOString(),
-      version: 3,
-    })}\n`,
-    'utf8',
-  );
+  fs.writeFileSync(filePath, `${createSessionHeader(sessionId)}\n`, 'utf8');
 
   return filePath;
 }
@@ -34,17 +44,14 @@ export function ensureWorkingSession(sessionDir: string, sessionId: string): str
 export function appendWorkingMessage(sessionDir: string, sessionId: string, role: string, content: string): void {
   const filePath = ensureWorkingSession(sessionDir, sessionId);
 
-  fs.appendFileSync(
-    filePath,
-    `${JSON.stringify({
-      type: 'message',
-      id: crypto.randomUUID(),
-      parentId: null,
-      timestamp: new Date().toISOString(),
-      message: { role, content },
-    })}\n`,
-    'utf8',
-  );
+  fs.appendFileSync(filePath, `${createMessageLine(role, content)}\n`, 'utf8');
+}
+
+export function compactSession(sessionDir: string, sessionId: string, summary: string): void {
+  const filePath = workingFilePath(sessionDir);
+
+  ensureDir(filePath);
+  fs.writeFileSync(filePath, `${createSessionHeader(sessionId)}\n${createMessageLine('system', summary)}\n`, 'utf8');
 }
 
 export function buildWorkingContext(sessionDir: string): Array<{ role: string; content: string }> {
