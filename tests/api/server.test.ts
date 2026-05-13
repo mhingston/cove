@@ -210,4 +210,65 @@ describe('API server', () => {
       db.close();
     }
   });
+
+  it('threads optional chat context into routed API requests', async () => {
+    process.env.COVE_STATE_DIR = makeStateDir();
+
+    const db = getDb();
+    migrate(db);
+    db.prepare(
+      `INSERT INTO agent_groups (
+         id,
+         name,
+         workspace,
+         provider,
+         model,
+         thinking,
+         permissions,
+         soul,
+         config,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'default',
+      'Default Agent',
+      '/workspace/default',
+      'anthropic',
+      'group-model',
+      'medium',
+      '{"default":"ask"}',
+      'soul-default',
+      '{"api_key":"sk-test"}',
+      '2026-01-01T00:00:00.000Z',
+      '2026-01-01T00:00:00.000Z',
+    );
+
+    const server = startApiServer({
+      db,
+      port: 0,
+      chat: {
+        async ensureSessionRuntime() {
+          return false;
+        },
+      },
+    });
+
+    try {
+      const response = await fetch(`http://${server.hostname}:${server.port}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'Hello' }],
+        }),
+      });
+
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({ error: 'Container runtime unavailable' });
+    } finally {
+      await server.stop();
+      db.close();
+    }
+  });
 });

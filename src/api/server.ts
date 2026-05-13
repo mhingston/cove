@@ -1,11 +1,19 @@
 import type { Database } from 'bun:sqlite';
 
 import { handleHealth } from './handlers/health.ts';
+import {
+  handleApproveApproval,
+  handleCreateApproval,
+  handleDeclineApproval,
+  handleGetApproval,
+  handleListApprovals,
+} from './handlers/approvals.ts';
 import { handleChatCompletion } from './handlers/chat.ts';
 import { handleModels } from './handlers/models.ts';
 import { completeStreamRelay, failStreamRelay, pushStreamRelayChunk } from '../stream-relay.ts';
 import type { ApiServer } from '../shared/types.ts';
 import type { AppContext } from '../shared/types.ts';
+import type { ChatHandlerContext } from '../shared/types.ts';
 
 type ApiRoute = {
   method: string;
@@ -33,6 +41,41 @@ const apiRoutes: ApiRoute[] = [
     pathname: /^\/v1\/chat\/completions$/,
     handle(request, context) {
       return handleChatCompletion(request, context);
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/approvals$/,
+    handle(request, context) {
+      return handleCreateApproval(request, context.db);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/approvals$/,
+    handle(request, context) {
+      return handleListApprovals(request, context.db);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/approvals\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleGetApproval(request, context.db, { id: match[1] });
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/approvals\/([^/]+)\/approve$/,
+    handle(request, context, match) {
+      return handleApproveApproval(request, context.db, { id: match[1] });
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/approvals\/([^/]+)\/decline$/,
+    handle(request, context, match) {
+      return handleDeclineApproval(request, context.db, { id: match[1] });
     },
   },
   {
@@ -110,10 +153,10 @@ export function routeApiRequest(
   return Response.json({ error: 'Not Found' }, { status: 404 });
 }
 
-export function startApiServer(options: { db: Database; port?: number }): ApiServer {
+export function startApiServer(options: { db: Database; port?: number; chat?: ChatHandlerContext }): ApiServer {
   const requestedPort = options.port ?? resolvePort();
   const hostname = '127.0.0.1';
-  const context = { db: options.db };
+  const context: AppContext = { db: options.db, chat: options.chat };
 
   const server = Bun.serve({
     hostname,

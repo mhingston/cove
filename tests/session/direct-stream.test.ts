@@ -142,4 +142,31 @@ describe('streamDirectSessionTokens', () => {
       db.close();
     }
   });
+
+  it('uses the real container-agent runner by default when no runContainerSession dep is supplied', async () => {
+    const stateDir = makeStateDir();
+    const db = new Database(':memory:');
+    migrate(db);
+
+    const routing = makeRoutingResult(stateDir, { sessionId: 'sess-stream-default-runner' });
+    const tokens: string[] = [];
+
+    try {
+      for await (const token of streamDirectSessionTokens({
+        centralDb: db,
+        routing,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-request',
+        },
+        messages: [{ role: 'user', content: 'Use default runner' }],
+      })) {
+        tokens.push(token);
+      }
+
+      expect(tokens).toEqual(['Processed: Use default runner']);
+    } finally {
+      db.close();
+    }
+  });
 });

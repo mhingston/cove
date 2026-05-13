@@ -65,6 +65,10 @@ export type ModelResponseItem = {
 export type WarmPool = {
   start(): Promise<void>;
   stop(): Promise<void>;
+  acquire(): Promise<{ sessionId: string; containerName: string; sessionDir: string } | null>;
+  consume(sessionId: string): void;
+  release(sessionId: string): void;
+  getStats(): { ready: number; allocated: number; starting: number };
 };
 
 export type Scheduler = {

@@ -1,6 +1,10 @@
 import type { Database } from 'bun:sqlite';
 import path from 'node:path';
 
+import {
+  runContainerSession as runContainerSessionDefault,
+  type ContainerSessionDeps,
+} from '../container-agent/runner.ts';
 import { appendWorkingMessage, ensureWorkingSession } from '../context/working.ts';
 import { initSessionFolder } from './manager.ts';
 import { openInboundDb, writeInboundMessage } from './inbound.ts';
@@ -24,10 +28,10 @@ export type DirectStreamDeps = {
   runContainerSession?: (
     options: RunContainerSessionOptions,
     onResponse?: (response: string) => void,
-    deps?: unknown,
+    deps?: ContainerSessionDeps,
     onToken?: (token: string) => void,
   ) => Promise<string>;
-  runnerDeps?: unknown;
+  runnerDeps?: ContainerSessionDeps;
   connectStream?: (request: DirectStreamRequest) => AsyncGenerator<string, void, undefined>;
 };
 
@@ -120,10 +124,6 @@ function streamQueue<T>() {
   };
 }
 
-async function defaultRunContainerSession(): Promise<string> {
-  return '';
-}
-
 export async function* streamDirectSessionTokens(
   request: DirectStreamRequest,
   deps: DirectStreamDeps = {},
@@ -179,7 +179,7 @@ export async function* streamDirectSessionTokens(
   }
 
   const queue = streamQueue<string>();
-  const runContainerSession = deps.runContainerSession ?? defaultRunContainerSession;
+  const runContainerSession = deps.runContainerSession ?? runContainerSessionDefault;
   const task = runContainerSession(
     {
       inboundPath: inboundDbPath(sessionDir),

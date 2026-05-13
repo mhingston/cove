@@ -159,6 +159,17 @@ export function killContainer(sessionId: string, _reason?: string): void {
   entry.running = false;
 }
 
+export function restartContainer(sessionId: string, reason?: string): boolean {
+  const entry = activeContainers.get(sessionId);
+
+  if (entry == null) {
+    return false;
+  }
+
+  killContainer(sessionId, reason);
+  return spawnContainer(entry.options);
+}
+
 export function getActiveContainers(): Map<string, ContainerEntry> {
   return activeContainers;
 }

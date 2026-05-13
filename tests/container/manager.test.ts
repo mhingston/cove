@@ -10,6 +10,7 @@ import {
   getActiveContainers,
   isContainerRunning,
   killContainer,
+  restartContainer,
   spawnContainer,
   type ContainerStartOptions,
 } from '../../src/container/spawn.ts';
@@ -116,6 +117,46 @@ describe('container manager', () => {
 
   it('killContainer does not throw when the session is unknown', () => {
     expect(() => killContainer('nonexistent-session')).not.toThrow();
+  });
+
+  it('restartContainer restarts a tracked container using its stored options', () => {
+    const tmpDir = makeTempDir('cove-v2-manager-restart-');
+    const runtimePath = path.join(tmpDir, 'fake-runtime.sh');
+    const logPath = path.join(tmpDir, 'runtime.log');
+
+    fs.writeFileSync(
+      runtimePath,
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then\n  exit 0\nfi\nprintf '%s\\n' "$@" >> "${logPath}"\nexit 0\n`,
+      'utf8',
+    );
+    fs.chmodSync(runtimePath, 0o755);
+    process.env.COVE_CONTAINER_RUNTIME_BIN = runtimePath;
+
+    getActiveContainers().set('sess-restart', {
+      name: 'tracked-container',
+      startedAt: Date.now(),
+      options: {
+        imageName: 'cove-agent:latest',
+        containerName: 'tracked-container',
+        sessionDir: '/tmp/cove-restart',
+        sessionId: 'sess-restart',
+        envVars: { COVE_SESSION_ID: 'sess-restart' },
+      },
+      process: {
+        kill: () => true,
+      } as never,
+      running: true,
+    });
+
+    const restarted = restartContainer('sess-restart', 'heartbeat stale');
+
+    expect(restarted).toBe(true);
+    expect(getActiveContainers().get('sess-restart')?.options.sessionDir).toBe('/tmp/cove-restart');
+    expect(fs.readFileSync(logPath, 'utf8')).toContain('tracked-container');
+  });
+
+  it('restartContainer returns false when the session is unknown', () => {
+    expect(restartContainer('missing-session')).toBe(false);
   });
 
   it('killContainer uses the configured runtime binary for tracked containers', () => {
