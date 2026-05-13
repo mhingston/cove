@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import { getDb } from '../../src/db/index.ts';
 import { migrate } from '../../src/db/migrate.ts';
 import { resolvePort, routeApiRequest, startApiServer } from '../../src/api/server.ts';
+import { openStreamRelay } from '../../src/stream-relay.ts';
 
 const stateDirs: string[] = [];
 
@@ -87,6 +88,42 @@ describe('API server', () => {
       expect(await response.json()).toEqual({ error: 'Not Found' });
     } finally {
       await server.stop();
+      db.close();
+    }
+  });
+
+  it('accepts internal relay chunk, complete, and error callbacks through the API surface', async () => {
+    process.env.COVE_STATE_DIR = makeStateDir();
+
+    const db = getDb();
+    migrate(db);
+
+    const relay = openStreamRelay('http://127.0.0.1:4111');
+    const iterator = relay.stream[Symbol.asyncIterator]();
+
+    try {
+      const chunkResponse = await routeApiRequest(
+        new Request(`http://cove.test/internal/streams/${relay.id}/chunk`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: 'Hello' }),
+        }),
+        { db },
+      );
+
+      expect(chunkResponse.status).toBe(204);
+      expect(await iterator.next()).toEqual({ value: 'Hello', done: false });
+
+      const completeResponse = await routeApiRequest(
+        new Request(`http://cove.test/internal/streams/${relay.id}/complete`, {
+          method: 'POST',
+        }),
+        { db },
+      );
+
+      expect(completeResponse.status).toBe(204);
+      expect(await iterator.next()).toEqual({ value: undefined, done: true });
+    } finally {
       db.close();
     }
   });

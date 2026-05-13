@@ -1,14 +1,16 @@
 import type { Database } from 'bun:sqlite';
 
 import { handleHealth } from './handlers/health.ts';
+import { handleChatCompletion } from './handlers/chat.ts';
 import { handleModels } from './handlers/models.ts';
+import { completeStreamRelay, failStreamRelay, pushStreamRelayChunk } from '../stream-relay.ts';
 import type { ApiServer } from '../shared/types.ts';
 import type { AppContext } from '../shared/types.ts';
 
 type ApiRoute = {
   method: string;
   pathname: RegExp;
-  handle(request: Request, context: AppContext): Response | Promise<Response>;
+  handle(request: Request, context: AppContext, match: RegExpMatchArray): Response | Promise<Response>;
 };
 
 const apiRoutes: ApiRoute[] = [
@@ -24,6 +26,46 @@ const apiRoutes: ApiRoute[] = [
     pathname: /^\/v1\/models$/,
     handle(_request, context) {
       return handleModels(context);
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/chat\/completions$/,
+    handle(request, context) {
+      return handleChatCompletion(request, context);
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/internal\/streams\/([^/]+)\/chunk$/,
+    async handle(request, _context, match) {
+      const relayId = match[1];
+      const body = await request.json() as { token?: string };
+
+      if (typeof relayId !== 'string' || typeof body.token !== 'string') {
+        return Response.json({ error: 'Invalid relay chunk payload' }, { status: 400 });
+      }
+
+      return new Response(null, { status: pushStreamRelayChunk(relayId, body.token) ? 204 : 404 });
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/internal\/streams\/([^/]+)\/complete$/,
+    handle(_request, _context, match) {
+      const relayId = match[1];
+      return new Response(null, { status: completeStreamRelay(relayId) ? 204 : 404 });
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/internal\/streams\/([^/]+)\/error$/,
+    async handle(request, _context, match) {
+      const relayId = match[1];
+      const body = await request.json() as { error?: string };
+      return new Response(null, {
+        status: failStreamRelay(relayId, new Error(body.error ?? 'Stream relay failed')) ? 204 : 404,
+      });
     },
   },
 ];
@@ -55,12 +97,14 @@ export function routeApiRequest(
   context: AppContext,
 ): Response | Promise<Response> {
   const url = new URL(request.url);
-  const route = apiRoutes.find(
-    ({ method, pathname }) => request.method === method && pathname.test(url.pathname),
-  );
+  const route = apiRoutes.find(({ method, pathname }) => request.method === method && pathname.test(url.pathname));
 
   if (route) {
-    return route.handle(request, context);
+    const match = url.pathname.match(route.pathname);
+
+    if (match) {
+      return route.handle(request, context, match);
+    }
   }
 
   return Response.json({ error: 'Not Found' }, { status: 404 });

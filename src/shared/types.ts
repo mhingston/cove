@@ -18,14 +18,15 @@ export type AgentGroupRow = AgentGroupSummaryRow & {
   config: string | null;
 };
 
-export type AppContext = {
-  db: Database;
-};
-
 export type ChatRoutingBody = {
   agent_group_id?: string;
   model?: string;
   thread_id?: string;
+};
+
+export type ChatMessage = {
+  role: SessionMessageRole;
+  content: string;
 };
 
 export type SessionRow = {
@@ -42,6 +43,16 @@ export type RoutedRequest = {
   agentGroup: AgentGroupRow;
   threadId: string;
   session: SessionRow;
+};
+
+export type SessionConfig = {
+  provider: string;
+  model: string;
+  thinking_level?: string | null;
+  api_key?: string | null;
+  workspace?: string | null;
+  extra_env?: Record<string, string> | null;
+  permissions?: string | null;
 };
 
 export type ModelResponseItem = {
@@ -124,4 +135,36 @@ export type ProcessingAckInput = {
   last_out_seq: number | null;
   container_id?: string | null;
   heartbeat_at: string;
+};
+
+export type ChatHandlerContext = {
+  routeRequest?(options: {
+    db: Database;
+    request: Request;
+    body: ChatRoutingBody;
+    stateDir?: string;
+  }): RoutedRequest;
+  pollForResponse?(options: {
+    db: Database;
+    sessionId: string;
+    baselineOutSeq: number;
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  }): Promise<OutboundMessageRow[]>;
+  ensureSessionRuntime?(options: {
+    routed: RoutedRequest;
+    config: SessionConfig;
+  }): boolean | Promise<boolean>;
+  streamTokens?(options: {
+    routed: RoutedRequest;
+    config: SessionConfig;
+    messages: ChatMessage[];
+  }): AsyncGenerator<string, void, undefined>;
+};
+
+export type AppContext = {
+  db: Database;
+  chat?: ChatHandlerContext;
 };
