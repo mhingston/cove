@@ -1,9 +1,13 @@
 import { Database } from 'bun:sqlite';
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { PermissionBridgeImpl } from '../control/permissions.ts';
 import { PolicyEngine } from '../control/policy.ts';
-import type { SessionConfig } from '../shared/types.ts';
+import { assembleContext } from '../context/assembly.ts';
+import { loadPersona } from '../context/persona.ts';
+import { parseRuntimeMcpConfig } from '../integrations/mcp.ts';
+import type { ChatMessage, SessionConfig } from '../shared/types.ts';
 import { openInboundDb } from '../session/inbound.ts';
 import {
   getNextOutboundSeq,
@@ -45,14 +49,30 @@ type ToolCallResult = {
 } | undefined;
 
 type ToolCallHandler = (event: ToolCallEvent) => Promise<ToolCallResult> | ToolCallResult;
+type BeforeAgentStartHandler = (event: { systemPrompt?: string }) => Promise<{ systemPrompt?: string } | undefined> | { systemPrompt?: string } | undefined;
+type ContextHandler = (event: {
+  messages?: Array<{ role: string; content?: unknown }>;
+}) => Promise<{ messages?: Array<{ role: string; content: Array<{ type: 'text'; text: string }>; timestamp: number }> } | undefined>
+  | { messages?: Array<{ role: string; content: Array<{ type: 'text'; text: string }>; timestamp: number }> }
+  | undefined;
 
 type ExtensionRuntime = {
   on(event: 'tool_call', handler: ToolCallHandler): void;
+  on(event: 'before_agent_start', handler: BeforeAgentStartHandler): void;
+  on(event: 'context', handler: ContextHandler): void;
 };
 
 type ExtensionFactory = (runtime: ExtensionRuntime) => void;
 
 type RunnerResourceLoader = {
+  cwd?: string;
+  agentDir?: string;
+  additionalExtensionPaths?: string[];
+  noExtensions?: boolean;
+  noSkills?: boolean;
+  noPromptTemplates?: boolean;
+  noThemes?: boolean;
+  noContextFiles?: boolean;
   extensionFactories?: ExtensionFactory[];
 };
 
@@ -74,6 +94,7 @@ type CreateSessionOptions = {
 export type ContainerSessionDeps = {
   createSession?(options: CreateSessionOptions): Promise<RunnerSessionResult>;
   createCoveTools?(db?: Database, embedTexts?: EmbedTexts, runtime?: { agentGroupId?: string; centralDbPath?: string }): ToolDefinition[];
+  resolveInstalledPackageDir?(packageName: string): string | undefined;
 };
 
 export type RunContainerSessionOptions = {
@@ -205,6 +226,54 @@ function getCentralDbPath(config: SessionConfig): string | undefined {
 
 function getAgentGroupId(config: SessionConfig): string | undefined {
   return config.extra_env?.COVE_AGENT_GROUP_ID ?? process.env.COVE_AGENT_GROUP_ID;
+}
+
+function toText(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((part) => {
+        if (part != null && typeof part === 'object' && 'text' in part && typeof (part as { text: unknown }).text === 'string') {
+          return (part as { text: string }).text;
+        }
+
+        return '';
+      })
+      .join('');
+  }
+
+  return '';
+}
+
+function resolveInstalledPackageDir(packageName: string): string | undefined {
+  return undefined;
+}
+
+function prepareMcpAgentDir(config: SessionConfig, sessionStateDir: string, resolvePackageDir: (packageName: string) => string | undefined): {
+  agentDir: string;
+  packageDir: string;
+} | undefined {
+  const rawConfig = config.extra_env?.COVE_MCP_CONFIG ?? process.env.COVE_MCP_CONFIG;
+  const mcpConfig = parseRuntimeMcpConfig(rawConfig);
+
+  if (mcpConfig == null) {
+    return undefined;
+  }
+
+  const packageDir = resolvePackageDir('pi-mcp-adapter');
+
+  if (packageDir == null) {
+    return undefined;
+  }
+
+  const agentDir = path.join(sessionStateDir, '.pi-agent');
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.writeFileSync(path.join(agentDir, 'mcp.json'), JSON.stringify(mcpConfig, null, 2), 'utf8');
+
+  return { agentDir, packageDir };
 }
 
 function resolveCustomTools(
@@ -425,22 +494,86 @@ function createDefaultSession(): Promise<RunnerSessionResult> {
 const defaultDeps: Required<ContainerSessionDeps> = {
   createSession: createDefaultSession,
   createCoveTools,
+  resolveInstalledPackageDir,
 };
 
 function buildResourceLoader(options: {
   config: SessionConfig;
   sessionId: string;
+  sessionStateDir: string;
   approvalResume?: ApprovalResumeMetadata;
   onBlocked(result: BlockedToolResult): void;
+  resolveInstalledPackageDir: (packageName: string) => string | undefined;
 }): RunnerResourceLoader {
   const policy = new PolicyEngine({ overrides: parsePermissionOverrides(options.config) });
   const bridge = new PermissionBridgeImpl({ policy });
   const centralDbPath = getCentralDbPath(options.config);
   const agentGroupId = getAgentGroupId(options.config);
+  const mcpAgentDir = prepareMcpAgentDir(options.config, options.sessionStateDir, options.resolveInstalledPackageDir);
+  const subagentPackageDir = agentGroupId == null ? undefined : options.resolveInstalledPackageDir('pi-subagents');
+  const additionalExtensionPaths = [subagentPackageDir, mcpAgentDir?.packageDir].filter((value): value is string => value != null);
+  const persona = agentGroupId == null || centralDbPath == null
+    ? undefined
+    : loadPersona(agentGroupId, {
+        dbPath: centralDbPath,
+        allowFilesystemFallback: false,
+      }) ?? undefined;
 
   return {
+    cwd: options.config.workspace ?? process.cwd(),
+    agentDir: mcpAgentDir?.agentDir,
+    additionalExtensionPaths,
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
     extensionFactories: [
       (runtime) => {
+        runtime.on('before_agent_start', async (event) => {
+          if (persona == null) {
+            return undefined;
+          }
+
+          return {
+            systemPrompt: `${event.systemPrompt ?? ''}\n\n${persona}`.trim(),
+          };
+        });
+
+        runtime.on('context', async (event) => {
+          if (agentGroupId == null || centralDbPath == null) {
+            return undefined;
+          }
+
+          const centralDb = new Database(centralDbPath);
+
+          try {
+            const normalizedMessages: ChatMessage[] = (event.messages ?? []).map((message) => ({
+              role: message.role,
+              content: toText(message.content),
+            })) as ChatMessage[];
+            const assembled = await assembleContext({
+              agentGroupId,
+              sessionId: options.sessionId,
+              messages: normalizedMessages,
+              db: centralDb,
+              sessionDir: options.sessionStateDir,
+              persona,
+            });
+            const withoutPersona = persona == null ? assembled : assembled.slice(1);
+
+            return {
+              messages: withoutPersona.map((message) => ({
+                role: message.role,
+                content: [{ type: 'text', text: message.content }],
+                timestamp: Date.now(),
+              })),
+            };
+          } finally {
+            centralDb.close();
+          }
+        });
+
         runtime.on('tool_call', async (event) => {
           const toolArgs = event.input;
           const tier = bridge.getTier(event.toolName, toolArgs);
@@ -531,6 +664,7 @@ export async function runContainerSession(
 ): Promise<string> {
   const inboundDb = openInboundDb(path.dirname(options.inboundPath));
   const outboundDb = openOutboundDb(path.dirname(options.outboundPath));
+  const sessionStateDir = path.dirname(options.inboundPath);
 
   try {
     const persistedConfig = readSessionConfig(inboundDb);
@@ -564,6 +698,7 @@ export async function runContainerSession(
 
     const createSession = deps.createSession ?? defaultDeps.createSession;
     const createCustomTools = deps.createCoveTools ?? defaultDeps.createCoveTools;
+    const resolvePackageDir = deps.resolveInstalledPackageDir ?? defaultDeps.resolveInstalledPackageDir;
     const customTools = resolveCustomTools(createCustomTools, effectiveConfig);
     const { session } = await createSession({
       config: effectiveConfig,
@@ -578,10 +713,12 @@ export async function runContainerSession(
       const resourceLoader = buildResourceLoader({
         config: effectiveConfig,
         sessionId,
+        sessionStateDir,
         approvalResume,
         onBlocked(result) {
           blockedToolResult = result;
         },
+        resolveInstalledPackageDir: resolvePackageDir,
       });
 
       const currentSession = (

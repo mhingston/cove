@@ -2,6 +2,7 @@ import type { Database } from 'bun:sqlite';
 
 import { appendWorkingMessage, buildWorkingContext, ensureWorkingSession } from '../../context/working.ts';
 import { DeliveryTimeoutError, pollForResponse } from '../../delivery.ts';
+import { resolveRuntimeMcpConfig, serializeRuntimeMcpConfig } from '../../integrations/mcp.ts';
 import { routeRequest } from '../../router.ts';
 import { streamDirectSessionTokens } from '../../session/direct-stream.ts';
 import { openInboundDb, writeInboundMessage } from '../../session/inbound.ts';
@@ -116,11 +117,7 @@ function parseAgentGroupConfig(configValue: string | null): {
 
 function buildSessionConfig(routed: ReturnType<typeof routeRequest>, requestBody: ChatRequestBody): SessionConfig {
   const parsedConfig = parseAgentGroupConfig(routed.agentGroup.config);
-  const mcpConfig = parsedConfig != null && 'mcpServers' in (parsedConfig as Record<string, unknown>)
-    ? JSON.stringify({
-        mcpServers: (parsedConfig as Record<string, unknown>).mcpServers,
-      })
-    : null;
+  const mcpConfig = serializeRuntimeMcpConfig(resolveRuntimeMcpConfig(parsedConfig ?? undefined)) ?? null;
   const extraEnv = {
     ...(parsedConfig?.extra_env ?? {}),
     ...(mcpConfig == null ? {} : { COVE_MCP_CONFIG: mcpConfig }),

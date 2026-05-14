@@ -9,6 +9,7 @@ import { getDb } from './db/index.ts';
 import { getStateDir } from './db/index.ts';
 import { migrate } from './db/migrate.ts';
 import { startSweep as startDefaultSweep } from './host-sweep.ts';
+import { resolveRuntimeMcpConfig, serializeRuntimeMcpConfig } from './integrations/mcp.ts';
 import {
   createScheduler as createDefaultScheduler,
   registerRunAgentPrompt,
@@ -117,11 +118,7 @@ function buildScheduledSessionConfig(agentGroup: {
   config: string | null;
 }): SessionConfig {
   const parsedConfig = parseAgentGroupConfig(agentGroup.config);
-  const mcpConfig = parsedConfig != null && 'mcpServers' in (parsedConfig as Record<string, unknown>)
-    ? JSON.stringify({
-        mcpServers: (parsedConfig as Record<string, unknown>).mcpServers,
-      })
-    : null;
+  const mcpConfig = serializeRuntimeMcpConfig(resolveRuntimeMcpConfig(parsedConfig ?? undefined)) ?? null;
   const extraEnv = {
     ...(parsedConfig?.extra_env ?? {}),
     ...(mcpConfig == null ? {} : { COVE_MCP_CONFIG: mcpConfig }),

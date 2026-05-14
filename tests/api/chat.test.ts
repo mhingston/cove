@@ -537,85 +537,96 @@ describe('chat completions api', () => {
   });
 
   it('serializes MCP config into extra_env.COVE_MCP_CONFIG when agent-group config includes mcp settings', async () => {
-    const stateDir = makeStateDir();
-    process.env.COVE_STATE_DIR = stateDir;
+    const expectedMcpConfig = {
+      mcpServers: {
+        local: {
+          command: 'npx',
+          args: ['-y', '@demo/mcp'],
+        },
+      },
+    };
 
-    const db = new Database(':memory:');
-    migrate(db);
-    insertAgentGroup(db, {
-      id: 'chat-group-1',
-      config: JSON.stringify({
+    for (const config of [
+      JSON.stringify({
         api_key: 'sk-chat-test',
         extra_env: { CUSTOM_FLAG: 'enabled' },
-        mcpServers: {
-          local: {
-            command: 'npx',
-            args: ['-y', '@demo/mcp'],
-          },
-        },
+        mcpServers: expectedMcpConfig.mcpServers,
       }),
-    });
+      JSON.stringify({
+        api_key: 'sk-chat-test',
+        extra_env: { CUSTOM_FLAG: 'enabled' },
+        mcp_config: JSON.stringify(expectedMcpConfig),
+      }),
+      JSON.stringify({
+        api_key: 'sk-chat-test',
+        extra_env: { CUSTOM_FLAG: 'enabled' },
+        mcpConfig: expectedMcpConfig,
+      }),
+    ]) {
+      const stateDir = makeStateDir();
+      process.env.COVE_STATE_DIR = stateDir;
 
-    try {
-      const response = await createApp({
-        db,
-        chat: {
-          async pollForResponse(): Promise<OutboundMessageRow[]> {
-            return [
-              {
-                id: 'assistant-mcp',
-                seq: 3,
-                role: 'assistant',
-                content: 'MCP configured',
-                finish_reason: 'stop',
-                tool_calls: null,
-                metadata: null,
-                created_at: '2026-01-01T00:00:00.000Z',
-              },
-            ];
-          },
-        },
-      }).fetch(
-        new Request('http://cove.test/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            agent_group_id: 'chat-group-1',
-            thread_id: 'thread-mcp',
-            messages: [{ role: 'user', content: 'Use MCP' }],
-          }),
-        }),
-      );
-
-      expect(response.status).toBe(200);
-
-      const sessionRow = db
-        .prepare('SELECT session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?')
-        .get('chat-group-1', 'thread-mcp') as { session_file: string | null };
-
-      const inboundDb = new Database(path.join(sessionRow.session_file!, 'inbound.db'));
+      const db = new Database(':memory:');
+      migrate(db);
+      insertAgentGroup(db, {
+        id: 'chat-group-1',
+        config,
+      });
 
       try {
-        const configRow = inboundDb.prepare('SELECT extra_env FROM session_config').get() as {
-          extra_env: string | null;
-        };
-        const extraEnv = JSON.parse(configRow.extra_env ?? '{}') as Record<string, string>;
-
-        expect(extraEnv.CUSTOM_FLAG).toBe('enabled');
-        expect(extraEnv.COVE_MCP_CONFIG).toBeTruthy();
-        expect(JSON.parse(extraEnv.COVE_MCP_CONFIG)).toEqual({
-          mcpServers: {
-            local: {
-              command: 'npx',
-              args: ['-y', '@demo/mcp'],
+        const response = await createApp({
+          db,
+          chat: {
+            async pollForResponse(): Promise<OutboundMessageRow[]> {
+              return [
+                {
+                  id: 'assistant-mcp',
+                  seq: 3,
+                  role: 'assistant',
+                  content: 'MCP configured',
+                  finish_reason: 'stop',
+                  tool_calls: null,
+                  metadata: null,
+                  created_at: '2026-01-01T00:00:00.000Z',
+                },
+              ];
             },
           },
-        });
+        }).fetch(
+          new Request('http://cove.test/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              agent_group_id: 'chat-group-1',
+              thread_id: 'thread-mcp',
+              messages: [{ role: 'user', content: 'Use MCP' }],
+            }),
+          }),
+        );
+
+        expect(response.status).toBe(200);
+
+        const sessionRow = db
+          .prepare('SELECT session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?')
+          .get('chat-group-1', 'thread-mcp') as { session_file: string | null };
+
+        const inboundDb = new Database(path.join(sessionRow.session_file!, 'inbound.db'));
+
+        try {
+          const configRow = inboundDb.prepare('SELECT extra_env FROM session_config').get() as {
+            extra_env: string | null;
+          };
+          const extraEnv = JSON.parse(configRow.extra_env ?? '{}') as Record<string, string>;
+
+          expect(extraEnv.CUSTOM_FLAG).toBe('enabled');
+          expect(extraEnv.COVE_MCP_CONFIG).toBeTruthy();
+          expect(JSON.parse(extraEnv.COVE_MCP_CONFIG)).toEqual(expectedMcpConfig);
+        } finally {
+          inboundDb.close();
+        }
       } finally {
-        inboundDb.close();
+        db.close();
       }
-    } finally {
-      db.close();
     }
   });
 

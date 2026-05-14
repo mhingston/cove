@@ -196,10 +196,18 @@ function readApprovals(dbPath: string): Array<{
 function createFakeDeps(options: {
   responseText?: string;
   toolCall?: { toolName: string; input: Record<string, unknown> };
-  capture?: { promptedMessages: string[] };
+  capture?: {
+    promptedMessages: string[];
+    resourceLoaders?: Array<unknown>;
+    customToolsHistory?: Array<unknown>;
+    configs?: SessionConfig[];
+  };
 } = {}): ContainerSessionDeps {
   return {
     async createSession(sessionOptions) {
+      options.capture?.resourceLoaders?.push(sessionOptions.resourceLoader);
+      options.capture?.customToolsHistory?.push(sessionOptions.customTools);
+      options.capture?.configs?.push(sessionOptions.config);
       const listeners = new Set<(event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void>();
 
       return {
@@ -219,7 +227,7 @@ function createFakeDeps(options: {
               factory({
                 on(event, handler) {
                   if (event === 'tool_call') {
-                    handlers.push(handler);
+                    handlers.push(handler as (event: { toolName: string; input: Record<string, unknown> }) => Promise<{ block?: boolean; reason?: string } | undefined> | { block?: boolean; reason?: string } | undefined);
                   }
                 },
               });
@@ -697,5 +705,236 @@ describe('container runner phase 5', () => {
       centralDbPath,
     });
     expect(captured.customTools?.map((tool) => tool.name)).toEqual(['wiki_search']);
+  });
+
+  it('writes a session-local MCP config file and passes locked-down resource-loader options when runtime MCP config is present', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-mcp-');
+    const sessionId = 'sess-mcp-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_MCP_CONFIG: JSON.stringify({
+          mcpServers: {
+            github: {
+              command: 'npx',
+              args: ['-y', '@modelcontextprotocol/server-github'],
+            },
+          },
+        }),
+      },
+    });
+    writeUserMessage(sessionDir, 'List MCP tools');
+
+    const captured = {
+      promptedMessages: [] as string[],
+      resourceLoaders: [] as Array<unknown>,
+    };
+    const deps: ContainerSessionDeps = {
+      ...createFakeDeps({ capture: captured }),
+      resolveInstalledPackageDir(packageName) {
+        return packageName === 'pi-mcp-adapter' ? `/tmp/node_modules/${packageName}` : undefined;
+      },
+    };
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      deps,
+    );
+
+    const mcpPath = path.join(sessionDir, '.pi-agent', 'mcp.json');
+    expect(JSON.parse(fs.readFileSync(mcpPath, 'utf8'))).toEqual({
+      mcpServers: {
+        github: {
+          command: 'npx',
+          args: ['-y', '@modelcontextprotocol/server-github'],
+        },
+      },
+    });
+
+    expect(captured.resourceLoaders).toContainEqual(expect.objectContaining({
+      cwd: process.cwd(),
+      agentDir: path.join(sessionDir, '.pi-agent'),
+      additionalExtensionPaths: ['/tmp/node_modules/pi-mcp-adapter'],
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+      extensionFactories: expect.any(Array),
+    }));
+  });
+
+  it('adds the installed pi-subagents package to the resource-loader when an agent group is present', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-subagents-');
+    const sessionId = 'sess-subagents-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: 'group-subagents-1',
+      },
+    });
+    writeUserMessage(sessionDir, 'Delegate this');
+
+    const captured = {
+      promptedMessages: [] as string[],
+      resourceLoaders: [] as Array<unknown>,
+    };
+    const deps: ContainerSessionDeps = {
+      ...createFakeDeps({ capture: captured }),
+      resolveInstalledPackageDir(packageName) {
+        return packageName === 'pi-subagents' ? `/tmp/node_modules/${packageName}` : undefined;
+      },
+    };
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      deps,
+    );
+
+    expect(captured.resourceLoaders).toContainEqual(expect.objectContaining({
+      additionalExtensionPaths: ['/tmp/node_modules/pi-subagents'],
+    }));
+  });
+
+  it('registers persona and assembled-context extension hooks for agent-group runtimes', async () => {
+    const stateDir = makeTempDir('cove-v2-runner-context-state-');
+    const sessionDir = path.join(stateDir, 'sessions', 'group-context-1', 'sess-context-1');
+    const sessionId = 'sess-context-1';
+    const agentGroupId = 'group-context-1';
+    const centralDbPath = setupCentralDb({ stateDir, sessionId, agentGroupId, sessionDir });
+
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionDir, 'working.jsonl'), [
+      JSON.stringify({ type: 'session', id: sessionId, timestamp: new Date().toISOString(), version: 3 }),
+      JSON.stringify({
+        type: 'message',
+        id: 'work-1',
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        message: { role: 'user', content: 'Earlier working note' },
+      }),
+    ].join('\n') + '\n');
+
+    const centralDb = new Database(centralDbPath);
+    try {
+      centralDb.prepare('UPDATE agent_groups SET soul = ? WHERE id = ?').run('Be concise and factual.', agentGroupId);
+      centralDb.prepare(
+        'INSERT INTO memories (id, content, embedding, agent_group_id, session_id, importance, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      ).run(
+        'mem-1',
+        'Remember the rollout checklist for this agent.',
+        null,
+        agentGroupId,
+        null,
+        0.5,
+        new Date().toISOString(),
+      );
+      centralDb.prepare(
+        'INSERT INTO memories_fts(rowid, content) VALUES ((SELECT rowid FROM memories WHERE id = ?), ?)',
+      ).run('mem-1', 'Remember the rollout checklist for this agent.');
+    } finally {
+      centralDb.close();
+    }
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: agentGroupId,
+        COVE_CENTRAL_DB_PATH: centralDbPath,
+      },
+    });
+    writeUserMessage(sessionDir, 'What is the rollout checklist?');
+
+    let resolvedSystemPrompt = 'base system prompt';
+    let transformedMessages: unknown[] | undefined;
+    const deps: ContainerSessionDeps = {
+      async createSession(sessionOptions) {
+        const beforeAgentStartHandlers: Array<(event: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>> = [];
+        const contextHandlers: Array<(event: Record<string, unknown>) => Promise<Record<string, unknown> | undefined>> = [];
+
+        for (const factory of sessionOptions.resourceLoader?.extensionFactories ?? []) {
+          factory({
+            on(event, handler) {
+              if (event === 'before_agent_start') {
+                beforeAgentStartHandlers.push(handler as never);
+              }
+              if (event === 'context') {
+                contextHandlers.push(handler as never);
+              }
+            },
+          });
+        }
+
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {
+              for (const handler of beforeAgentStartHandlers) {
+                const result = await handler({ systemPrompt: resolvedSystemPrompt });
+                if (typeof result?.systemPrompt === 'string') {
+                  resolvedSystemPrompt = result.systemPrompt;
+                }
+              }
+
+              let currentMessages: unknown[] = [{ role: 'user', content: [{ type: 'text', text: 'What is the rollout checklist?' }] }];
+              for (const handler of contextHandlers) {
+                const result = await handler({ messages: currentMessages });
+                if (Array.isArray(result?.messages)) {
+                  currentMessages = result.messages;
+                }
+              }
+              transformedMessages = currentMessages;
+            },
+          },
+        };
+      },
+      createCoveTools() {
+        return [];
+      },
+    };
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      deps,
+    );
+
+    expect(resolvedSystemPrompt).toContain('base system prompt');
+    expect(resolvedSystemPrompt).toContain('Be concise and factual.');
+    expect(JSON.stringify(transformedMessages)).toContain('Earlier working note');
+    expect(JSON.stringify(transformedMessages)).toContain('rollout checklist');
   });
 });
