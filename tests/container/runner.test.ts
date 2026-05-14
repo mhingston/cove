@@ -307,6 +307,47 @@ describe('container runner phase 5', () => {
     });
   });
 
+  it('skips live custom tool creation when no central db path is configured', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-no-live-tools-');
+    const sessionId = 'sess-no-live-tools-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, 'Reply without wiki or memory tools.');
+
+    const captured: { customToolsHistory: Array<Array<{ name: string }> | undefined> } = {
+      customToolsHistory: [],
+    };
+    const deps: ContainerSessionDeps = {
+      async createSession(sessionOptions) {
+        captured.customToolsHistory.push(sessionOptions.customTools as Array<{ name: string }> | undefined);
+        return createFakeDeps({ responseText: 'No live tools required' }).createSession!(sessionOptions);
+      },
+      createCoveTools() {
+        throw new Error('COVE_CENTRAL_DB_PATH is required for live container tools');
+      },
+    };
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      deps,
+    );
+
+    expect(response).toBe('No live tools required');
+    expect(captured.customToolsHistory).toEqual([undefined, undefined]);
+  });
+
   it('creates a pending approval and writes confirm metadata for blocked confirm-tier tool calls', async () => {
     const stateDir = makeTempDir('cove-v2-runner-confirm-state-');
     const sessionDir = path.join(stateDir, 'sessions', 'group-confirm-1', 'sess-confirm-1');
@@ -599,5 +640,62 @@ describe('container runner phase 5', () => {
       last_in_seq: 4,
       last_out_seq: 9,
     });
+  });
+
+  it('passes runtime tool scope into createCoveTools and forwards custom tools into session creation', async () => {
+    const stateDir = makeTempDir('cove-v2-runner-tools-state-');
+    const sessionDir = path.join(stateDir, 'sessions', 'group-tools-runtime', 'sess-tools-runtime');
+    const sessionId = 'sess-tools-runtime';
+    const agentGroupId = 'group-tools-runtime';
+    const centralDbPath = setupCentralDb({ stateDir, sessionId, agentGroupId, sessionDir });
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: agentGroupId,
+        COVE_CENTRAL_DB_PATH: centralDbPath,
+      },
+    });
+    writeUserMessage(sessionDir, 'Hello from custom tools');
+
+    const captured: { promptedMessages: string[]; createCoveToolsArgs?: unknown[]; customTools?: Array<{ name: string }> } = {
+      promptedMessages: [],
+    };
+    const deps: ContainerSessionDeps = {
+      async createSession(sessionOptions) {
+        captured.customTools = sessionOptions.customTools as Array<{ name: string }> | undefined;
+        return createFakeDeps({ capture: { promptedMessages: captured.promptedMessages } }).createSession!(sessionOptions);
+      },
+      createCoveTools(db, _embedTexts, runtime) {
+        captured.createCoveToolsArgs = [db, runtime];
+        return [{
+          name: 'wiki_search',
+          description: 'Test tool',
+          parameters: { type: 'object', properties: {} },
+          execute: async () => ({ content: [{ type: 'text', text: '{}' }], details: {} }),
+        }];
+      },
+    };
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      deps,
+    );
+
+    expect(captured.createCoveToolsArgs?.[1]).toEqual({
+      agentGroupId,
+      centralDbPath,
+    });
+    expect(captured.customTools?.map((tool) => tool.name)).toEqual(['wiki_search']);
   });
 });

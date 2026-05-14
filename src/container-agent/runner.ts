@@ -12,6 +12,8 @@ import {
   writeOutboundMessage,
   writeProcessingAck,
 } from '../session/outbound.ts';
+import { createCoveTools, type ToolDefinition } from './tools.ts';
+import type { EmbedTexts } from '../context/external.ts';
 
 type PermissionTier = 'auto' | 'prompt' | 'confirm';
 
@@ -66,10 +68,12 @@ type RunnerSessionResult = {
 type CreateSessionOptions = {
   config: SessionConfig;
   resourceLoader?: RunnerResourceLoader;
+  customTools?: ToolDefinition[];
 };
 
 export type ContainerSessionDeps = {
   createSession?(options: CreateSessionOptions): Promise<RunnerSessionResult>;
+  createCoveTools?(db?: Database, embedTexts?: EmbedTexts, runtime?: { agentGroupId?: string; centralDbPath?: string }): ToolDefinition[];
 };
 
 export type RunContainerSessionOptions = {
@@ -201,6 +205,22 @@ function getCentralDbPath(config: SessionConfig): string | undefined {
 
 function getAgentGroupId(config: SessionConfig): string | undefined {
   return config.extra_env?.COVE_AGENT_GROUP_ID ?? process.env.COVE_AGENT_GROUP_ID;
+}
+
+function resolveCustomTools(
+  createCustomTools: Required<ContainerSessionDeps>['createCoveTools'],
+  config: SessionConfig,
+): ToolDefinition[] | undefined {
+  const runtime = {
+    agentGroupId: getAgentGroupId(config),
+    centralDbPath: getCentralDbPath(config),
+  };
+
+  if (!runtime.centralDbPath) {
+    return undefined;
+  }
+
+  return createCustomTools(undefined, undefined, runtime);
 }
 
 function getApprovalTtlMs(): number {
@@ -404,6 +424,7 @@ function createDefaultSession(): Promise<RunnerSessionResult> {
 
 const defaultDeps: Required<ContainerSessionDeps> = {
   createSession: createDefaultSession,
+  createCoveTools,
 };
 
 function buildResourceLoader(options: {
@@ -542,9 +563,12 @@ export async function runContainerSession(
     }
 
     const createSession = deps.createSession ?? defaultDeps.createSession;
+    const createCustomTools = deps.createCoveTools ?? defaultDeps.createCoveTools;
+    const customTools = resolveCustomTools(createCustomTools, effectiveConfig);
     const { session } = await createSession({
       config: effectiveConfig,
       resourceLoader: { extensionFactories: [] },
+      customTools,
     });
     let lastResponse = '';
 
@@ -564,6 +588,7 @@ export async function runContainerSession(
         await createSession({
           config: effectiveConfig,
           resourceLoader,
+          customTools,
         })
       ).session;
 

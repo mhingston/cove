@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import type { ChatMessage, SessionMessageRole } from '../shared/types.ts';
+
 function workingFilePath(sessionDir: string): string {
   return path.join(sessionDir, 'working.jsonl');
 }
@@ -54,7 +56,11 @@ export function compactSession(sessionDir: string, sessionId: string, summary: s
   fs.writeFileSync(filePath, `${createSessionHeader(sessionId)}\n${createMessageLine('system', summary)}\n`, 'utf8');
 }
 
-export function buildWorkingContext(sessionDir: string): Array<{ role: string; content: string }> {
+function isSessionMessageRole(value: unknown): value is SessionMessageRole {
+  return value === 'user' || value === 'assistant' || value === 'system' || value === 'tool';
+}
+
+export function buildWorkingContext(sessionDir: string): ChatMessage[] {
   const filePath = workingFilePath(sessionDir);
 
   if (!fs.existsSync(filePath)) {
@@ -62,7 +68,7 @@ export function buildWorkingContext(sessionDir: string): Array<{ role: string; c
   }
 
   const lines = fs.readFileSync(filePath, 'utf8').trim().split('\n').filter(Boolean);
-  const messages: Array<{ role: string; content: string }> = [];
+  const messages: ChatMessage[] = [];
 
   for (const line of lines) {
     const parsed = JSON.parse(line) as {
@@ -70,7 +76,7 @@ export function buildWorkingContext(sessionDir: string): Array<{ role: string; c
       message?: { role?: string; content?: string };
     };
 
-    if (parsed.type === 'message' && parsed.message?.role && parsed.message?.content) {
+    if (parsed.type === 'message' && isSessionMessageRole(parsed.message?.role) && parsed.message?.content) {
       messages.push({ role: parsed.message.role, content: parsed.message.content });
     }
   }

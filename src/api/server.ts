@@ -10,6 +10,13 @@ import {
 } from './handlers/approvals.ts';
 import { handleChatCompletion } from './handlers/chat.ts';
 import { handleModels } from './handlers/models.ts';
+import {
+  handleCreateWiki,
+  handleDeleteWiki,
+  handleGetWiki,
+  handleListOrSearchWiki,
+  handleUpdateWiki,
+} from './handlers/wiki.ts';
 import { completeStreamRelay, failStreamRelay, pushStreamRelayChunk } from '../stream-relay.ts';
 import type { ApiServer } from '../shared/types.ts';
 import type { AppContext } from '../shared/types.ts';
@@ -55,6 +62,48 @@ const apiRoutes: ApiRoute[] = [
     pathname: /^\/v1\/approvals$/,
     handle(request, context) {
       return handleListApprovals(request, context.db);
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/wiki$/,
+    handle(request, context) {
+      return handleCreateWiki(request, context.db);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/wiki$/,
+    handle(request, context) {
+      return handleListOrSearchWiki(request, context.db);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/wiki\/search$/,
+    handle(request, context) {
+      return handleListOrSearchWiki(request, context.db);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/wiki\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleGetWiki(request, context.db, { slug: match[1] });
+    },
+  },
+  {
+    method: 'PUT',
+    pathname: /^\/v1\/wiki\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleUpdateWiki(request, context.db, { slug: match[1] });
+    },
+  },
+  {
+    method: 'DELETE',
+    pathname: /^\/v1\/wiki\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleDeleteWiki(request, context.db, { slug: match[1] });
     },
   },
   {

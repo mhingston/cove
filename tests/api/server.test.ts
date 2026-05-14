@@ -4,6 +4,13 @@ import fs from 'node:fs';
 import { getDb } from '../../src/db/index.ts';
 import { migrate } from '../../src/db/migrate.ts';
 import { resolvePort, routeApiRequest, startApiServer } from '../../src/api/server.ts';
+import {
+  createWikiEntry,
+  hybridSearchWikiEntries,
+  listWikiEntries,
+  readWikiFile,
+  type WikiFileRecord,
+} from '../../src/knowledge/wiki.ts';
 import { openStreamRelay } from '../../src/stream-relay.ts';
 
 const stateDirs: string[] = [];
@@ -21,6 +28,18 @@ function makeStateDir(): string {
   const dir = `${stateDir}cove-v2-api-${crypto.randomUUID()}`;
   stateDirs.push(dir);
   return dir;
+}
+
+async function json<T>(response: Response): Promise<T> {
+  return await response.json() as T;
+}
+
+function createWikiDb(): ReturnType<typeof getDb> {
+  process.env.COVE_STATE_DIR = makeStateDir();
+
+  const db = getDb();
+  migrate(db);
+  return db;
 }
 
 describe('API server', () => {
@@ -270,5 +289,502 @@ describe('API server', () => {
       await server.stop();
       db.close();
     }
+  });
+
+  describe('wiki routes', () => {
+    it('returns 201 and the unchanged WikiFileRecord JSON shape from POST /v1/wiki', async () => {
+      const db = createWikiDb();
+
+      try {
+        const response = await routeApiRequest(
+          new Request('http://cove.test/v1/wiki', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              slug: 'beach-guide',
+              title: 'Beach Guide',
+              content: 'Packing and planning notes',
+              tags: ['travel', 'beach'],
+              provenance: 'human',
+              created_by: 'alice',
+            }),
+          }),
+          { db },
+        );
+
+        expect(response.status).toBe(201);
+        const createdEntry = readWikiFile('beach-guide');
+
+        if (createdEntry == null) {
+          throw new Error('Expected POST /v1/wiki to create a file-backed wiki entry');
+        }
+
+        expect(await json<WikiFileRecord>(response)).toEqual(createdEntry);
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 409 with a JSON error when POST /v1/wiki attempts to create a duplicate slug', async () => {
+      const db = createWikiDb();
+
+      try {
+        createWikiEntry({
+          slug: 'beach-guide',
+          title: 'Beach Guide',
+          content: 'Packing and planning notes',
+          db,
+        });
+
+        const response = await routeApiRequest(
+          new Request('http://cove.test/v1/wiki', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              slug: 'beach-guide',
+              title: 'Duplicate Beach Guide',
+              content: 'Duplicate content',
+            }),
+          }),
+          { db },
+        );
+
+        expect(response.status).toBe(409);
+        expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 400 with a JSON error when POST /v1/wiki receives invalid JSON', async () => {
+      const db = createWikiDb();
+
+      try {
+        const response = await routeApiRequest(
+          new Request('http://cove.test/v1/wiki', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{"slug":"beach-guide"',
+          }),
+          { db },
+        );
+
+        expect(response.status).toBe(400);
+        expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 400 when POST /v1/wiki receives a null payload', async () => {
+      const db = createWikiDb();
+
+      try {
+        const response = await routeApiRequest(
+          new Request('http://cove.test/v1/wiki', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(null),
+          }),
+          { db },
+        );
+
+        expect(response.status).toBe(400);
+        expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 400 when POST /v1/wiki receives an array or other non-object payload', async () => {
+      const db = createWikiDb();
+
+      try {
+        for (const payload of [[], 'beach-guide', 42, true]) {
+          const response = await routeApiRequest(
+            new Request('http://cove.test/v1/wiki', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            }),
+            { db },
+          );
+
+          expect(response.status).toBe(400);
+          expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+        }
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 400 when POST /v1/wiki receives missing required fields or wrong field types', async () => {
+      const db = createWikiDb();
+
+      try {
+        for (const payload of [
+          { slug: 'beach-guide', content: 'Packing and planning notes' },
+          { slug: 123, title: 'Beach Guide', content: 'Packing and planning notes' },
+          { slug: 'beach-guide', title: false, content: 'Packing and planning notes' },
+          { slug: 'beach-guide', title: 'Beach Guide', content: { body: 'notes' } },
+        ]) {
+          const response = await routeApiRequest(
+            new Request('http://cove.test/v1/wiki', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            }),
+            { db },
+          );
+
+          expect(response.status).toBe(400);
+          expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+        }
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 400 when POST /v1/wiki receives non-string provenance or created_by', async () => {
+      const db = createWikiDb();
+
+      try {
+        for (const payload of [
+          {
+            slug: 'beach-guide',
+            title: 'Beach Guide',
+            content: 'Packing and planning notes',
+            provenance: { source: 'human' },
+          },
+          {
+            slug: 'beach-guide',
+            title: 'Beach Guide',
+            content: 'Packing and planning notes',
+            created_by: ['alice'],
+          },
+        ]) {
+          const response = await routeApiRequest(
+            new Request('http://cove.test/v1/wiki', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            }),
+            { db },
+          );
+
+          expect(response.status).toBe(400);
+          expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+        }
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 400 when POST /v1/wiki receives invalid tags shapes or content', async () => {
+      const db = createWikiDb();
+
+      try {
+        for (const payload of [
+          {
+            slug: 'beach-guide',
+            title: 'Beach Guide',
+            content: 'Packing and planning notes',
+            tags: 'travel',
+          },
+          {
+            slug: 'beach-guide',
+            title: 'Beach Guide',
+            content: 'Packing and planning notes',
+            tags: ['travel', 123],
+          },
+        ]) {
+          const response = await routeApiRequest(
+            new Request('http://cove.test/v1/wiki', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            }),
+            { db },
+          );
+
+          expect(response.status).toBe(400);
+          expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+        }
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 400 when POST /v1/wiki receives multiline metadata fields', async () => {
+      const db = createWikiDb();
+
+      try {
+        for (const payload of [
+          {
+            slug: 'beach-guide-title',
+            title: 'Beach\nGuide',
+            content: 'Packing and planning notes',
+          },
+          {
+            slug: 'beach-guide-provenance',
+            title: 'Beach Guide',
+            content: 'Packing and planning notes',
+            provenance: 'human\nsource',
+          },
+          {
+            slug: 'beach-guide-created-by',
+            title: 'Beach Guide',
+            content: 'Packing and planning notes',
+            created_by: 'alice\nbob',
+          },
+          {
+            slug: 'beach-guide-tags',
+            title: 'Beach Guide',
+            content: 'Packing and planning notes',
+            tags: ['travel', 'beach\ntrip'],
+          },
+        ]) {
+          const response = await routeApiRequest(
+            new Request('http://cove.test/v1/wiki', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            }),
+            { db },
+          );
+
+          expect(response.status).toBe(400);
+          expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+        }
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 400 when POST /v1/wiki receives an unsafe slug', async () => {
+      const db = createWikiDb();
+
+      try {
+        for (const slug of ['../x', 'nested/path']) {
+          const response = await routeApiRequest(
+            new Request('http://cove.test/v1/wiki', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                slug,
+                title: 'Unsafe Wiki',
+                content: 'Packing and planning notes',
+              }),
+            }),
+            { db },
+          );
+
+          expect(response.status).toBe(400);
+          expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+        }
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 500 with a client-safe JSON error when POST /v1/wiki hits an unexpected create failure', async () => {
+      const db = createWikiDb();
+      db.close();
+
+      const response = await routeApiRequest(
+        new Request('http://cove.test/v1/wiki', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            slug: 'beach-guide',
+            title: 'Beach Guide',
+            content: 'Packing and planning notes',
+          }),
+        }),
+        { db },
+      );
+
+      expect(response.status).toBe(500);
+      expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+    });
+
+    it('returns the list order from listWikiEntries on GET /v1/wiki without q', async () => {
+      const db = createWikiDb();
+
+      try {
+        createWikiEntry({
+          slug: 'beach-guide',
+          title: 'Beach Guide',
+          content: 'Packing and planning notes',
+          db,
+        });
+        createWikiEntry({
+          slug: 'mountain-guide',
+          title: 'Mountain Guide',
+          content: 'Layering and route notes',
+          db,
+        });
+
+        const response = await routeApiRequest(new Request('http://cove.test/v1/wiki'), { db });
+
+        expect(response.status).toBe(200);
+        expect(await json<WikiFileRecord[]>(response)).toEqual(listWikiEntries(db));
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns the search order from hybridSearchWikiEntries on GET /v1/wiki with a non-blank q', async () => {
+      const db = createWikiDb();
+
+      try {
+        createWikiEntry({
+          slug: 'beach-guide',
+          title: 'Beach Guide',
+          content: 'Packing and planning notes',
+          tags: ['travel', 'beach'],
+          db,
+        });
+        createWikiEntry({
+          slug: 'beach-workout',
+          title: 'Beach Workout',
+          content: 'Sand sprints and beach conditioning',
+          tags: ['fitness'],
+          db,
+        });
+        createWikiEntry({
+          slug: 'mountain-guide',
+          title: 'Mountain Guide',
+          content: 'Layering and route notes',
+          tags: ['travel'],
+          db,
+        });
+
+        const expected = await hybridSearchWikiEntries('beach', db);
+        const response = await routeApiRequest(new Request('http://cove.test/v1/wiki?q=beach'), { db });
+
+        expect(expected.length).toBeGreaterThan(0);
+        expect(response.status).toBe(200);
+        expect(await json<WikiFileRecord[]>(response)).toEqual(expected);
+      } finally {
+        db.close();
+      }
+    });
+
+    it('treats blank and whitespace q values on GET /v1/wiki as list behavior', async () => {
+      const db = createWikiDb();
+
+      try {
+        createWikiEntry({
+          slug: 'beach-guide',
+          title: 'Beach Guide',
+          content: 'Packing and planning notes',
+          db,
+        });
+        createWikiEntry({
+          slug: 'mountain-guide',
+          title: 'Mountain Guide',
+          content: 'Layering and route notes',
+          db,
+        });
+
+        const expected = listWikiEntries(db);
+
+        for (const url of [
+          'http://cove.test/v1/wiki?q=',
+          'http://cove.test/v1/wiki?q=%20%20%20',
+        ]) {
+          const response = await routeApiRequest(new Request(url), { db });
+
+          expect(response.status).toBe(200);
+          expect(await json<WikiFileRecord[]>(response)).toEqual(expected);
+        }
+      } finally {
+        db.close();
+      }
+    });
+
+    it('matches GET /v1/wiki?q=... when GET /v1/wiki/search receives a non-blank q', async () => {
+      const db = createWikiDb();
+
+      try {
+        createWikiEntry({
+          slug: 'beach-guide',
+          title: 'Beach Guide',
+          content: 'Packing and planning notes',
+          tags: ['travel', 'beach'],
+          db,
+        });
+        createWikiEntry({
+          slug: 'beach-workout',
+          title: 'Beach Workout',
+          content: 'Sand sprints and beach conditioning',
+          db,
+        });
+
+        const listSearchResponse = await routeApiRequest(new Request('http://cove.test/v1/wiki?q=beach'), { db });
+        const aliasSearchResponse = await routeApiRequest(new Request('http://cove.test/v1/wiki/search?q=beach'), {
+          db,
+        });
+
+        expect(listSearchResponse.status).toBe(200);
+        expect(aliasSearchResponse.status).toBe(200);
+        expect(await json<WikiFileRecord[]>(aliasSearchResponse)).toEqual(
+          await json<WikiFileRecord[]>(listSearchResponse),
+        );
+      } finally {
+        db.close();
+      }
+    });
+
+    it('treats blank and whitespace q values on GET /v1/wiki/search as list behavior', async () => {
+      const db = createWikiDb();
+
+      try {
+        createWikiEntry({
+          slug: 'beach-guide',
+          title: 'Beach Guide',
+          content: 'Packing and planning notes',
+          db,
+        });
+        createWikiEntry({
+          slug: 'mountain-guide',
+          title: 'Mountain Guide',
+          content: 'Layering and route notes',
+          db,
+        });
+
+        const expected = listWikiEntries(db);
+
+        for (const url of [
+          'http://cove.test/v1/wiki/search',
+          'http://cove.test/v1/wiki/search?q=',
+          'http://cove.test/v1/wiki/search?q=%20%20%20',
+        ]) {
+          const response = await routeApiRequest(new Request(url), { db });
+
+          expect(response.status).toBe(200);
+          expect(await json<WikiFileRecord[]>(response)).toEqual(expected);
+        }
+      } finally {
+        db.close();
+      }
+    });
+
+    it('returns 500 with a client-safe JSON error when GET wiki routes hit unexpected failures', async () => {
+      const db = createWikiDb();
+      db.close();
+
+      for (const url of [
+        'http://cove.test/v1/wiki',
+        'http://cove.test/v1/wiki?q=beach',
+        'http://cove.test/v1/wiki/search?q=beach',
+      ]) {
+        const response = await routeApiRequest(new Request(url), { db });
+
+        expect(response.status).toBe(500);
+        expect(await json<{ error: string }>(response)).toEqual({ error: expect.any(String) });
+      }
+    });
   });
 });
