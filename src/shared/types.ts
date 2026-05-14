@@ -168,7 +168,22 @@ export type ChatHandlerContext = {
   }): AsyncGenerator<string, void, undefined>;
 };
 
+export type ScheduleRunAgentPrompt = (options: {
+  schedule: {
+    id: string;
+    agent_group_id: string;
+    prompt: string;
+    mode?: string;
+  };
+}) => Promise<{
+  content: string;
+  sessionId: string;
+  threadId: string;
+  lastRunAt: string;
+}>;
+
 export type AppContext = {
   db: Database;
   chat?: ChatHandlerContext;
+  runAgentPrompt?: ScheduleRunAgentPrompt;
 };

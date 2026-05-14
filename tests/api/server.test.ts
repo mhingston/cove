@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import { getDb } from '../../src/db/index.ts';
 import { migrate } from '../../src/db/migrate.ts';
 import { resolvePort, routeApiRequest, startApiServer } from '../../src/api/server.ts';
+import { createSchedule } from '../../src/jobs/schedules.ts';
 import {
   createWikiEntry,
   hybridSearchWikiEntries,
@@ -107,6 +108,94 @@ describe('API server', () => {
       expect(await response.json()).toEqual({ error: 'Not Found' });
     } finally {
       await server.stop();
+      db.close();
+    }
+  });
+
+  it('routes the schedule CRUD and run endpoints through the server routing entry point', async () => {
+    process.env.COVE_STATE_DIR = makeStateDir();
+
+    const db = getDb();
+    migrate(db);
+    db.prepare(
+      `INSERT INTO agent_groups (
+         id,
+         name,
+         workspace,
+         provider,
+         model,
+         thinking,
+         permissions,
+         soul,
+         config,
+         created_at,
+         updated_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'support',
+      'Support Agent',
+      '/workspace/support',
+      'anthropic',
+      'support-model',
+      'medium',
+      '{"default":"ask"}',
+      null,
+      null,
+      '2026-01-01T00:00:00.000Z',
+      '2026-01-01T00:00:00.000Z',
+    );
+    const schedule = createSchedule({
+      db,
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '0 9 * * *',
+        prompt: 'Server test schedule',
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+
+    try {
+      const listResponse = await routeApiRequest(new Request('http://cove.test/v1/schedules', { method: 'GET' }), { db });
+      const createResponse = await routeApiRequest(new Request('http://cove.test/v1/schedules', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            agent_group_id: 'support',
+            cron_expr: '0 10 * * *',
+            prompt: 'Created through route test',
+          }),
+        }), { db });
+      const getResponse = await routeApiRequest(new Request(`http://cove.test/v1/schedules/${schedule.id}`, { method: 'GET' }), {
+        db,
+      });
+      const updateResponse = await routeApiRequest(new Request(`http://cove.test/v1/schedules/${schedule.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: 'Updated through route test' }),
+        }), { db });
+      const runResponse = await routeApiRequest(new Request(`http://cove.test/v1/schedules/${schedule.id}/run`, { method: 'POST' }), {
+        db,
+        runAgentPrompt: async (options) => ({
+          content: `Ran ${options.schedule.id}`,
+          sessionId: 'session-1',
+          threadId: `schedule:${options.schedule.id}`,
+          lastRunAt: '2026-01-15T09:00:00.000Z',
+        }),
+      });
+      const deleteResponse = await routeApiRequest(new Request(`http://cove.test/v1/schedules/${schedule.id}`, { method: 'DELETE' }), {
+        db,
+      });
+
+      expect([
+        listResponse.status,
+        createResponse.status,
+        getResponse.status,
+        updateResponse.status,
+        runResponse.status,
+        deleteResponse.status,
+      ]).toEqual([200, 201, 200, 200, 200, 204]);
+    } finally {
       db.close();
     }
   });

@@ -631,8 +631,9 @@ describe('default warm-pool sizing isolation', () => {
     });
 
     try {
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout.toString() + result.stderr.toString()).toContain('1 pass');
+      const output = result.stdout.toString() + result.stderr.toString();
+      expect(result.exitCode, output).toBe(0);
+      expect(output).toContain('1 pass');
     } finally {
       fs.rmSync(tempTestPath, { force: true });
     }
@@ -726,8 +727,434 @@ describe('default sweep wiring isolation', () => {
     });
 
     try {
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout.toString() + result.stderr.toString()).toContain('1 pass');
+      const output = result.stdout.toString() + result.stderr.toString();
+      expect(result.exitCode, output).toBe(0);
+      expect(output).toContain('1 pass');
+    } finally {
+      fs.rmSync(tempTestPath, { force: true });
+    }
+  });
+
+  it('uses the real default scheduler wiring and registers runtime sync hooks', async () => {
+    const tempTestPath = path.join(
+      path.dirname(import.meta.path),
+      `.scheduler-defaults-${crypto.randomUUID()}.test.ts`,
+    );
+    const tempTestSource = `
+import { describe, expect, it, mock } from 'bun:test';
+import { Database } from 'bun:sqlite';
+
+let capturedOptions;
+const events = [];
+
+mock.module('../src/jobs/cron-scheduler.ts', () => ({
+  createScheduler(db) {
+    capturedOptions = { db };
+    return {
+      upsertSchedule() {},
+      removeSchedule() {},
+      async start() {
+        events.push('scheduler.start');
+      },
+      async stop() {
+        events.push('scheduler.stop');
+      },
+    };
+  },
+  getRegisteredRunAgentPrompt() {
+    return null;
+  },
+  removeSchedule() {},
+  registerRunAgentPrompt() {},
+  setScheduleRuntimeSync(sync) {
+    events.push(sync == null ? 'sync.clear' : 'sync.set');
+  },
+  upsertSchedule() {},
+}));
+
+const { boot } = await import('../src/index.ts?scheduler-defaults=' + ${JSON.stringify(crypto.randomUUID())});
+
+describe('default scheduler wiring isolation', () => {
+  it('builds the default scheduler and clears sync hooks on shutdown', async () => {
+    const db = {
+      close() {},
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        return db;
+      },
+      migrate() {},
+      async cleanupOrphans() {},
+      createWarmPool() {
+        return {
+          async start() {},
+          async stop() {},
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {},
+        };
+      },
+      startApiServer() {
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {},
+        };
+      },
+    });
+
+    try {
+      expect(capturedOptions).toEqual({ db });
+      expect(events).toEqual(['sync.set', 'scheduler.start']);
+    } finally {
+      await runtime.stop();
+    }
+
+    expect(events).toEqual(['sync.set', 'scheduler.start', 'scheduler.stop', 'sync.clear']);
+  });
+});
+`;
+
+    fs.writeFileSync(tempTestPath, tempTestSource);
+
+    const result = Bun.spawnSync(['bun', 'test', tempTestPath], {
+      cwd: path.dirname(import.meta.dir),
+      env: process.env,
+      stderr: 'pipe',
+      stdout: 'pipe',
+    });
+
+    try {
+      const output = result.stdout.toString() + result.stderr.toString();
+      expect(result.exitCode, output).toBe(0);
+      expect(output).toContain('1 pass');
+    } finally {
+      fs.rmSync(tempTestPath, { force: true });
+    }
+  });
+
+  it('builds one shared runAgentPrompt during boot and passes it into the default scheduler', async () => {
+    const tempTestPath = path.join(
+      path.dirname(import.meta.path),
+      `.scheduler-run-agent-prompt-${crypto.randomUUID()}.test.ts`,
+    );
+    const tempTestSource = `
+import { describe, expect, it, mock } from 'bun:test';
+import { Database } from 'bun:sqlite';
+
+let createSchedulerArgs;
+let createRunAgentPromptArgs;
+let ensureSessionRuntimeArgs;
+let registerRunAgentPromptArgs;
+const sharedRunAgentPrompt = async () => ({
+  content: 'ok',
+  sessionId: 'session-1',
+  threadId: 'schedule:schedule-1',
+  lastRunAt: '2026-01-15T09:00:00.000Z',
+});
+
+mock.module('../src/jobs/run-agent-prompt.ts', () => ({
+  createScheduleThreadId(scheduleId) {
+    return 'schedule:' + scheduleId;
+  },
+  createRunAgentPrompt(args) {
+    createRunAgentPromptArgs = args;
+    return sharedRunAgentPrompt;
+  },
+}));
+
+mock.module('../src/session/runtime.ts', () => ({
+  createEnsureSessionRuntime(args) {
+    ensureSessionRuntimeArgs = args;
+    return async () => true;
+  },
+}));
+
+mock.module('../src/jobs/cron-scheduler.ts', () => ({
+  createScheduler(db) {
+    createSchedulerArgs = { db };
+    return {
+      upsertSchedule() {},
+      removeSchedule() {},
+      async start() {},
+      async stop() {},
+    };
+  },
+  getRegisteredRunAgentPrompt() {
+    return null;
+  },
+  removeSchedule() {},
+  registerRunAgentPrompt(runAgentPrompt) {
+    registerRunAgentPromptArgs = runAgentPrompt;
+  },
+  setScheduleRuntimeSync() {},
+  upsertSchedule() {},
+}));
+
+const { boot } = await import('../src/index.ts?scheduler-run-agent-prompt=' + ${JSON.stringify(crypto.randomUUID())});
+
+describe('default scheduler runAgentPrompt isolation', () => {
+  it('registers the shared boot-built helper before calling createScheduler(db)', async () => {
+    const db = {
+      close() {},
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        return db;
+      },
+      migrate() {},
+      async cleanupOrphans() {},
+      createWarmPool() {
+        return {
+          async start() {},
+          async stop() {},
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {},
+        };
+      },
+      startApiServer() {
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {},
+        };
+      },
+    });
+
+    try {
+      expect(createRunAgentPromptArgs).toBeDefined();
+      expect(ensureSessionRuntimeArgs).toMatchObject({ db });
+      expect(registerRunAgentPromptArgs).toBe(sharedRunAgentPrompt);
+      expect(createSchedulerArgs).toEqual({ db });
+    } finally {
+      await runtime.stop();
+    }
+  });
+});
+`;
+
+    fs.writeFileSync(tempTestPath, tempTestSource);
+
+    const result = Bun.spawnSync(['bun', 'test', tempTestPath], {
+      cwd: path.dirname(import.meta.dir),
+      env: process.env,
+      stderr: 'pipe',
+      stdout: 'pipe',
+    });
+
+    try {
+      const output = result.stdout.toString() + result.stderr.toString();
+      expect(result.exitCode, output).toBe(0);
+      expect(output).toContain('1 pass');
+    } finally {
+      fs.rmSync(tempTestPath, { force: true });
+    }
+  });
+
+  it('avoids duplicating user turns when replaying a mixed-role transcript through the shared runAgentPrompt seam', async () => {
+    const tempTestPath = path.join(
+      path.dirname(import.meta.path),
+      `.scheduler-mixed-replay-${crypto.randomUUID()}.test.ts`,
+    );
+    const tempTestSource = `
+import { afterAll, describe, expect, it, mock } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import fs from 'node:fs';
+
+import { openInboundDb } from '../src/session/inbound.ts';
+
+let createRunAgentPromptArgs;
+const sessionDir = '/tmp/cove-v2-mixed-replay-' + crypto.randomUUID();
+
+mock.module('../src/jobs/run-agent-prompt.ts', () => ({
+  createScheduleThreadId(scheduleId) {
+    return 'schedule:' + scheduleId;
+  },
+  createRunAgentPrompt(args) {
+    createRunAgentPromptArgs = args;
+    return async () => ({
+      content: 'ok',
+      sessionId: 'session-1',
+      threadId: 'schedule:schedule-1',
+      lastRunAt: '2026-01-15T09:00:00.000Z',
+    });
+  },
+}));
+
+mock.module('../src/session/runtime.ts', () => ({
+  createEnsureSessionRuntime() {
+    return async () => true;
+  },
+}));
+
+mock.module('../src/router.ts', () => ({
+  routeRequest() {
+    return {
+      agentGroup: {
+        id: 'support',
+        provider: 'anthropic',
+        model: 'support-model',
+        thinking: 'medium',
+        workspace: '/workspace/support',
+        permissions: '{}',
+        config: null,
+      },
+      threadId: 'schedule:schedule-1',
+      session: {
+        id: 'session-1',
+        agent_group_id: 'support',
+        thread_id: 'schedule:schedule-1',
+        session_file: sessionDir,
+        metadata: null,
+        created_at: '2026-01-15T08:00:00.000Z',
+        updated_at: '2026-01-15T08:00:00.000Z',
+      },
+    };
+  },
+}));
+
+mock.module('../src/jobs/cron-scheduler.ts', () => ({
+  createScheduler() {
+    return {
+      upsertSchedule() {},
+      removeSchedule() {},
+      async start() {},
+      async stop() {},
+    };
+  },
+  getRegisteredRunAgentPrompt() {
+    return null;
+  },
+  removeSchedule() {},
+  registerRunAgentPrompt() {},
+  setScheduleRuntimeSync() {},
+  upsertSchedule() {},
+}));
+
+mock.module('../src/delivery.ts', () => ({
+  DeliveryTimeoutError: class DeliveryTimeoutError extends Error {},
+  pollForResponse() {
+    return Promise.resolve([]);
+  },
+}));
+
+const { boot } = await import('../src/index.ts?scheduler-mixed-replay=' + ${JSON.stringify(crypto.randomUUID())});
+
+afterAll(() => {
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+});
+
+describe('mixed-role replay safety isolation', () => {
+  it('compares replay prefixes against the persisted executable subset only', async () => {
+    const db = {
+      close() {},
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        return db;
+      },
+      migrate() {},
+      async cleanupOrphans() {},
+      createWarmPool() {
+        return {
+          async start() {},
+          async stop() {},
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {},
+        };
+      },
+      startApiServer() {
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {},
+        };
+      },
+    });
+
+    try {
+      await createRunAgentPromptArgs.execute({
+        agent_group_id: 'support',
+        thread_id: 'schedule:schedule-1',
+        messages: [
+          { role: 'assistant', content: 'Previously answered' },
+          { role: 'user', content: 'Run now' },
+        ],
+      });
+      await createRunAgentPromptArgs.execute({
+        agent_group_id: 'support',
+        thread_id: 'schedule:schedule-1',
+        messages: [
+          { role: 'assistant', content: 'Previously answered' },
+          { role: 'user', content: 'Run now' },
+        ],
+      });
+
+      const inboundDb = openInboundDb(sessionDir);
+
+      try {
+        const rows = inboundDb.prepare('SELECT role, content FROM messages_in ORDER BY seq ASC').all();
+        expect(rows).toEqual([
+          { role: 'user', content: 'Run now' },
+        ]);
+      } finally {
+        inboundDb.close();
+      }
+    } finally {
+      await runtime.stop();
+    }
+  });
+});
+`;
+
+    fs.writeFileSync(tempTestPath, tempTestSource);
+
+    const result = Bun.spawnSync(['bun', 'test', tempTestPath], {
+      cwd: path.dirname(import.meta.dir),
+      env: process.env,
+      stderr: 'pipe',
+      stdout: 'pipe',
+    });
+
+    try {
+      const output = result.stdout.toString() + result.stderr.toString();
+      expect(result.exitCode, output).toBe(0);
+      expect(output).toContain('1 pass');
     } finally {
       fs.rmSync(tempTestPath, { force: true });
     }

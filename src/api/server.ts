@@ -11,6 +11,14 @@ import {
 import { handleChatCompletion } from './handlers/chat.ts';
 import { handleModels } from './handlers/models.ts';
 import {
+  handleCreateSchedule,
+  handleDeleteSchedule,
+  handleGetSchedule,
+  handleListSchedules,
+  handleRunSchedule,
+  handleUpdateSchedule,
+} from './handlers/schedules.ts';
+import {
   handleCreateWiki,
   handleDeleteWiki,
   handleGetWiki,
@@ -62,6 +70,48 @@ const apiRoutes: ApiRoute[] = [
     pathname: /^\/v1\/approvals$/,
     handle(request, context) {
       return handleListApprovals(request, context.db);
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/schedules$/,
+    handle(request, context) {
+      return handleCreateSchedule(request, context.db);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/schedules$/,
+    handle(request, context) {
+      return handleListSchedules(request, context.db);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/schedules\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleGetSchedule(request, context.db, { id: match[1] });
+    },
+  },
+  {
+    method: 'PUT',
+    pathname: /^\/v1\/schedules\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleUpdateSchedule(request, context.db, { id: match[1] });
+    },
+  },
+  {
+    method: 'DELETE',
+    pathname: /^\/v1\/schedules\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleDeleteSchedule(request, context.db, { id: match[1] });
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/schedules\/([^/]+)\/run$/,
+    handle(request, context, match) {
+      return handleRunSchedule(request, context, { id: match[1] });
     },
   },
   {
