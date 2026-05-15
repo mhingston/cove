@@ -1,0 +1,9 @@
+{
+  "name": "@cove-v2/container-agent",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.55.0",
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

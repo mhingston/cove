@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it, mock } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -50,6 +50,8 @@ function makeRoutingResult(stateDir: string, overrides: Partial<RoutedRequest> &
 }
 
 afterEach(() => {
+  mock.restore();
+
   for (const stateDir of stateDirs.splice(0)) {
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
@@ -295,7 +297,6 @@ describe('streamDirectSessionTokens', () => {
         EXTRA_FLAG: 'kept',
         COVE_PERSONA: 'db persona',
         COVE_AGENT_GROUP_ID: 'stream-group',
-        COVE_CENTRAL_DB_PATH: '/app/session/cove.db',
       });
     } finally {
       db.close();
@@ -354,7 +355,6 @@ describe('streamDirectSessionTokens', () => {
         EXTRA_FLAG: 'kept',
         COVE_PERSONA: 'explicit persona',
         COVE_AGENT_GROUP_ID: 'stream-group',
-        COVE_CENTRAL_DB_PATH: '/app/session/cove.db',
       });
     } finally {
       db.close();
@@ -365,6 +365,61 @@ describe('streamDirectSessionTokens', () => {
     const stateDir = makeStateDir();
     const db = new Database(':memory:');
     migrate(db);
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey() {},
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession(sessionOptions: {
+        model?: { provider: string; id: string };
+        sessionManager?: { mode: string };
+      }) {
+        const listeners = new Set<(event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void>();
+
+        return {
+          session: {
+            subscribe(handler: (event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void) {
+              listeners.add(handler);
+              return () => {
+                listeners.delete(handler);
+              };
+            },
+            async prompt(message: string) {
+              for (const listener of listeners) {
+                listener({
+                  type: 'message_update',
+                  assistantMessageEvent: {
+                    type: 'text_delta',
+                    delta: `SDK:${sessionOptions.model?.provider}/${sessionOptions.model?.id}:${sessionOptions.sessionManager?.mode}:${message}`,
+                  },
+                });
+              }
+            },
+          },
+        };
+      },
+    }));
 
     const routing = makeRoutingResult(stateDir, { sessionId: 'sess-stream-default-runner' });
     const tokens: string[] = [];
@@ -382,7 +437,7 @@ describe('streamDirectSessionTokens', () => {
         tokens.push(token);
       }
 
-      expect(tokens).toEqual(['Processed: Use default runner']);
+      expect(tokens).toEqual(['SDK:anthropic/claude-request:continueRecent:Use default runner']);
     } finally {
       db.close();
     }

@@ -1,6 +1,8 @@
 import { Database } from 'bun:sqlite';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { PermissionBridgeImpl } from '../control/permissions.ts';
 import { PolicyEngine } from '../control/policy.ts';
@@ -17,7 +19,10 @@ import {
   writeProcessingAck,
 } from '../session/outbound.ts';
 import { createCoveTools, type ToolDefinition } from './tools.ts';
+import { setupContainerAgent } from './agent-setup.ts';
 import type { EmbedTexts } from '../context/external.ts';
+
+const require = createRequire(import.meta.url);
 
 type PermissionTier = 'auto' | 'prompt' | 'confirm';
 
@@ -85,8 +90,39 @@ type RunnerSessionResult = {
   session: RunnerSession;
 };
 
+type CodingAgentSdkModule = {
+  AuthStorage: {
+    inMemory(): {
+      setRuntimeApiKey(provider: string, apiKey: string): void;
+    };
+  };
+  ModelRegistry: {
+    inMemory(authStorage: {
+      setRuntimeApiKey(provider: string, apiKey: string): void;
+    }): {
+      find(provider: string, model: string): unknown;
+    };
+  };
+  SessionManager: {
+    inMemory(cwd?: string): unknown;
+    continueRecent(cwd?: string, sessionStateDir?: string): unknown;
+  };
+  createAgentSession(options: {
+    model?: unknown;
+    sessionManager?: unknown;
+    resourceLoader?: RunnerResourceLoader;
+    customTools?: ToolDefinition[];
+    thinkingLevel?: string | null;
+    authStorage?: unknown;
+    modelRegistry?: unknown;
+    cwd?: string;
+  }): Promise<RunnerSessionResult>;
+};
+
 type CreateSessionOptions = {
   config: SessionConfig;
+  sessionId?: string;
+  sessionStateDir?: string;
   resourceLoader?: RunnerResourceLoader;
   customTools?: ToolDefinition[];
 };
@@ -206,8 +242,11 @@ function mergeSessionConfig(runtimeConfig: SessionConfig, persistedConfig: Sessi
   }
 
   return {
-    ...runtimeConfig,
-    ...persistedConfig,
+    provider: persistedConfig.provider,
+    model: persistedConfig.model,
+    thinking_level: persistedConfig.thinking_level ?? runtimeConfig.thinking_level ?? null,
+    api_key: persistedConfig.api_key ?? runtimeConfig.api_key ?? null,
+    workspace: persistedConfig.workspace ?? runtimeConfig.workspace ?? null,
     extra_env: {
       ...(runtimeConfig.extra_env ?? {}),
       ...(persistedConfig.extra_env ?? {}),
@@ -249,7 +288,15 @@ function toText(value: unknown): string {
 }
 
 function resolveInstalledPackageDir(packageName: string): string | undefined {
-  return undefined;
+  try {
+    const packageJsonPath = require.resolve(`${packageName}/package.json`, {
+      paths: [process.cwd(), path.dirname(fileURLToPath(import.meta.url))],
+    });
+
+    return path.dirname(packageJsonPath);
+  } catch {
+    return undefined;
+  }
 }
 
 function prepareMcpAgentDir(config: SessionConfig, sessionStateDir: string, resolvePackageDir: (packageName: string) => string | undefined): {
@@ -386,6 +433,7 @@ function parseApprovalResumeMetadata(metadata: unknown): ApprovalResumeMetadata 
 
 function matchesApprovalResume(
   approvalResume: ApprovalResumeMetadata | undefined,
+  approvalId: string,
   toolName: string,
   toolArgs: Record<string, unknown>,
 ): boolean {
@@ -393,7 +441,9 @@ function matchesApprovalResume(
     return false;
   }
 
-  return approvalResume.tool_name === toolName && JSON.stringify(approvalResume.tool_args) === JSON.stringify(toolArgs);
+  return approvalResume.approval_id === approvalId
+    && approvalResume.tool_name === toolName
+    && JSON.stringify(approvalResume.tool_args) === JSON.stringify(toolArgs);
 }
 
 function isExpired(expiresAt: string): boolean {
@@ -463,32 +513,71 @@ function createPendingApproval(db: Database, options: {
   return { id, expires_at: expiresAt };
 }
 
-function createDefaultSession(): Promise<RunnerSessionResult> {
-  const listeners = new Set<(event: SessionMessageUpdate) => void>();
+function loadCodingAgentSdk(): CodingAgentSdkModule {
+  return require('@mariozechner/pi-coding-agent') as CodingAgentSdkModule;
+}
 
-  return Promise.resolve({
-    session: {
-      subscribe(handler) {
-        listeners.add(handler);
-        return () => {
-          listeners.delete(handler);
-        };
-      },
-      async prompt(message) {
-        const response = `Processed: ${message}`;
+async function createDefaultSession(options: CreateSessionOptions): Promise<RunnerSessionResult> {
+  const sdk = loadCodingAgentSdk();
+  let setupAuthStorage: ReturnType<typeof sdk.AuthStorage.inMemory> | undefined;
+  let setupModelRegistry: ReturnType<typeof sdk.ModelRegistry.inMemory> | undefined;
+  const setup = await setupContainerAgent({
+    provider: options.config.provider,
+    model: options.config.model,
+    apiKey: options.config.api_key,
+    sessionId: options.sessionId ?? getConfiguredSessionId(options.config),
+    sessionStateDir: options.sessionStateDir,
+  }, {
+    async createInMemoryAuth(input) {
+      const authStorage = sdk.AuthStorage.inMemory();
+      setupAuthStorage = authStorage;
 
-        for (const listener of listeners) {
-          listener({
-            type: 'message_update',
-            assistantMessageEvent: {
-              type: 'text_delta',
-              delta: response,
-            },
-          });
-        }
-      },
+      if (input.apiKey != null) {
+        authStorage.setRuntimeApiKey(input.provider, input.apiKey);
+      }
+
+      return authStorage;
+    },
+    async createModel(input) {
+      const authStorage = setupAuthStorage;
+
+      if (authStorage == null) {
+        throw new Error('Container agent auth storage was not initialized before model resolution.');
+      }
+
+      const modelRegistry = sdk.ModelRegistry.inMemory(authStorage);
+      setupModelRegistry = modelRegistry;
+      return modelRegistry.find(input.provider, input.model);
+    },
+    async createSessionManager(input) {
+      const cwd = options.config.workspace ?? process.cwd();
+      return input.mode === 'continueRecent'
+        ? sdk.SessionManager.continueRecent(cwd, input.sessionStateDir)
+        : sdk.SessionManager.inMemory(cwd);
+    },
+    async createSession(input) {
+      const modelRegistry = setupModelRegistry ?? sdk.ModelRegistry.inMemory(input.auth as {
+        setRuntimeApiKey(provider: string, apiKey: string): void;
+      });
+
+      if (input.model == null) {
+        throw new Error('No model resolved for container agent session.');
+      }
+
+      return sdk.createAgentSession({
+        authStorage: input.auth,
+        modelRegistry,
+        model: input.model,
+        sessionManager: input.sessionManager,
+        resourceLoader: options.resourceLoader,
+        customTools: options.customTools,
+        thinkingLevel: options.config.thinking_level,
+        cwd: options.config.workspace ?? process.cwd(),
+      });
     },
   });
+
+  return setup.session as RunnerSessionResult;
 }
 
 const defaultDeps: Required<ContainerSessionDeps> = {
@@ -611,11 +700,9 @@ function buildResourceLoader(options: {
             if (existing != null && isExpired(existing.expires_at)) {
               materializeExpiredApproval(db, existing.id);
             } else if (existing?.status === 'approved') {
-              if (matchesApprovalResume(options.approvalResume, event.toolName, toolArgs)) {
+              if (matchesApprovalResume(options.approvalResume, existing.id, event.toolName, toolArgs)) {
                 return undefined;
               }
-
-              return undefined;
             } else if (existing?.status === 'pending') {
               const result = buildApprovalNeededResult(existing.id, existing.expires_at, event.toolName, toolArgs);
               options.onBlocked(result);
@@ -700,11 +787,6 @@ export async function runContainerSession(
     const createCustomTools = deps.createCoveTools ?? defaultDeps.createCoveTools;
     const resolvePackageDir = deps.resolveInstalledPackageDir ?? defaultDeps.resolveInstalledPackageDir;
     const customTools = resolveCustomTools(createCustomTools, effectiveConfig);
-    const { session } = await createSession({
-      config: effectiveConfig,
-      resourceLoader: { extensionFactories: [] },
-      customTools,
-    });
     let lastResponse = '';
 
     for (const message of messages) {
@@ -724,6 +806,8 @@ export async function runContainerSession(
       const currentSession = (
         await createSession({
           config: effectiveConfig,
+          sessionId,
+          sessionStateDir,
           resourceLoader,
           customTools,
         })
@@ -775,8 +859,6 @@ export async function runContainerSession(
 
       onResponse?.(response);
     }
-
-    void session;
 
     return lastResponse;
   } finally {

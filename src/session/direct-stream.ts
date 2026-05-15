@@ -44,6 +44,16 @@ function outboundDbPath(sessionDir: string): string {
   return path.join(sessionDir, 'outbound.db');
 }
 
+function resolveHostCentralDbPath(db: Database): string | undefined {
+  const dbPath = db.filename?.trim();
+
+  if (!dbPath || dbPath === ':memory:') {
+    return undefined;
+  }
+
+  return dbPath;
+}
+
 function writeSessionConfig(db: Database, config: SessionConfig): void {
   db.exec('DELETE FROM session_config');
   db.prepare(
@@ -160,13 +170,14 @@ export async function* streamDirectSessionTokens(
     request.routing.agentGroup.id,
     request.centralDb,
   );
+  const hostCentralDbPath = resolveHostCentralDbPath(request.centralDb);
 
   const mergedConfig: SessionConfig = {
     ...configWithPersona,
     extra_env: {
       ...(configWithPersona.extra_env ?? {}),
       COVE_AGENT_GROUP_ID: request.routing.agentGroup.id,
-      COVE_CENTRAL_DB_PATH: '/app/session/cove.db',
+      ...(hostCentralDbPath == null ? {} : { COVE_CENTRAL_DB_PATH: hostCentralDbPath }),
     },
   };
 

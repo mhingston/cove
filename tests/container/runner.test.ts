@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it, mock } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -265,6 +265,111 @@ afterEach(() => {
 });
 
 describe('container runner phase 5', () => {
+  it('prefers persisted provider and model while preserving runtime-only config values', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-persisted-config-');
+    const sessionId = 'sess-persisted-config-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'auto',
+      model: 'anthropic/claude-persisted',
+      extra_env: {
+        PERSISTED_ONLY: 'persisted',
+      },
+    });
+    writeUserMessage(sessionDir, 'Use the persisted config.');
+
+    const captured = {
+      promptedMessages: [] as string[],
+      configs: [] as SessionConfig[],
+    };
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runtime',
+          api_key: 'runtime-api-key',
+          workspace: '/workspace/runtime-only',
+          extra_env: {
+            RUNTIME_ONLY: 'runtime',
+          },
+        },
+      },
+      undefined,
+      createFakeDeps({
+        responseText: 'Persisted config used',
+        capture: captured,
+      }),
+    );
+
+    expect(captured.promptedMessages).toEqual(['Use the persisted config.']);
+    expect(captured.configs).toEqual([
+      {
+        provider: 'auto',
+        model: 'anthropic/claude-persisted',
+        thinking_level: null,
+        api_key: 'runtime-api-key',
+        workspace: '/workspace/runtime-only',
+        extra_env: {
+          RUNTIME_ONLY: 'runtime',
+          PERSISTED_ONLY: 'persisted',
+        },
+        permissions: null,
+      },
+    ]);
+  });
+
+  it('merges extra_env with persisted values taking precedence over runtime conflicts', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-extra-env-merge-');
+    const sessionId = 'sess-extra-env-merge-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-persisted',
+      extra_env: {
+        SHARED_KEY: 'persisted',
+        PERSISTED_ONLY: 'persisted-only',
+      },
+    });
+    writeUserMessage(sessionDir, 'Merge runtime env.');
+
+    const captured = {
+      promptedMessages: [] as string[],
+      configs: [] as SessionConfig[],
+    };
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runtime',
+          extra_env: {
+            SHARED_KEY: 'runtime',
+            RUNTIME_ONLY: 'runtime-only',
+          },
+        },
+      },
+      undefined,
+      createFakeDeps({
+        responseText: 'Merged env used',
+        capture: captured,
+      }),
+    );
+
+    expect(captured.promptedMessages).toEqual(['Merge runtime env.']);
+    expect(captured.configs[0]?.extra_env).toEqual({
+      SHARED_KEY: 'persisted',
+      RUNTIME_ONLY: 'runtime-only',
+      PERSISTED_ONLY: 'persisted-only',
+    });
+  });
+
   it('blocks prompt-tier tool calls and writes prompt metadata as a normal assistant response', async () => {
     const sessionDir = makeTempDir('cove-v2-runner-prompt-');
     const sessionId = 'sess-prompt-1';
@@ -596,6 +701,146 @@ describe('container runner phase 5', () => {
     ]);
   });
 
+  it('requires a fresh confirm approval when an approved row has no approval_resume metadata', async () => {
+    const stateDir = makeTempDir('cove-v2-runner-approved-no-resume-');
+    const sessionDir = path.join(stateDir, 'sessions', 'group-approved-no-resume', 'sess-approved-no-resume');
+    const sessionId = 'sess-approved-no-resume';
+    const agentGroupId = 'group-approved-no-resume';
+    const centralDbPath = setupCentralDb({ stateDir, sessionId, agentGroupId, sessionDir });
+
+    insertApproval(centralDbPath, {
+      id: 'approval-approved-no-resume',
+      sessionId,
+      agentGroupId,
+      toolName: 'bash',
+      toolArgs: { command: 'rm -rf /tmp/demo' },
+      status: 'approved',
+      respondedAt: '2026-01-01T00:01:00.000Z',
+      expiresAt: new Date(Date.now() + 300_000).toISOString(),
+    });
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      permissions: JSON.stringify({ bash: 'confirm' }),
+      extra_env: {
+        COVE_AGENT_GROUP_ID: agentGroupId,
+        COVE_CENTRAL_DB_PATH: centralDbPath,
+      },
+    });
+    writeUserMessage(sessionDir, 'Delete without resume token.');
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createFakeDeps({
+        responseText: 'Deleted file',
+        toolCall: {
+          toolName: 'bash',
+          input: { command: 'rm -rf /tmp/demo' },
+        },
+      }),
+    );
+
+    const approvals = readApprovals(centralDbPath);
+
+    expect(response).toBe('Approval required to run bash: rm -rf /tmp/demo');
+    expect(approvals).toHaveLength(2);
+    expect(approvals[0]?.id).toBe('approval-approved-no-resume');
+    expect(approvals[0]?.status).toBe('approved');
+    expect(approvals[1]?.status).toBe('pending');
+    const outbound = readOutboundRows(sessionDir);
+
+    expect(outbound).toEqual([
+      {
+        seq: 3,
+        content: 'Approval required to run bash: rm -rf /tmp/demo',
+        metadata: expect.any(String),
+      },
+    ]);
+    expect(JSON.parse(outbound[0]?.metadata ?? 'null')).toEqual({
+      permission: 'confirm',
+      approval_id: approvals[1]?.id,
+      message: 'Approval required to run bash: rm -rf /tmp/demo',
+      tool_name: 'bash',
+      tool_args: { command: 'rm -rf /tmp/demo' },
+      expires_at: expect.any(String),
+    });
+  });
+
+  it('requires a fresh confirm approval when approval_resume metadata has the wrong approval id', async () => {
+    const stateDir = makeTempDir('cove-v2-runner-approved-wrong-resume-');
+    const sessionDir = path.join(stateDir, 'sessions', 'group-approved-wrong-resume', 'sess-approved-wrong-resume');
+    const sessionId = 'sess-approved-wrong-resume';
+    const agentGroupId = 'group-approved-wrong-resume';
+    const centralDbPath = setupCentralDb({ stateDir, sessionId, agentGroupId, sessionDir });
+    const approvalId = 'approval-approved-right-id';
+
+    insertApproval(centralDbPath, {
+      id: approvalId,
+      sessionId,
+      agentGroupId,
+      toolName: 'bash',
+      toolArgs: { command: 'rm -rf /tmp/demo' },
+      status: 'approved',
+      respondedAt: '2026-01-01T00:01:00.000Z',
+      expiresAt: new Date(Date.now() + 300_000).toISOString(),
+    });
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      permissions: JSON.stringify({ bash: 'confirm' }),
+      extra_env: {
+        COVE_AGENT_GROUP_ID: agentGroupId,
+        COVE_CENTRAL_DB_PATH: centralDbPath,
+      },
+    });
+    writeUserMessage(sessionDir, 'Delete with wrong resume token.', {
+      type: 'approval_resume',
+      approval_id: 'approval-approved-wrong-id',
+      tool_name: 'bash',
+      tool_args: { command: 'rm -rf /tmp/demo' },
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createFakeDeps({
+        responseText: 'Deleted file',
+        toolCall: {
+          toolName: 'bash',
+          input: { command: 'rm -rf /tmp/demo' },
+        },
+      }),
+    );
+
+    const approvals = readApprovals(centralDbPath);
+
+    expect(response).toBe('Approval required to run bash: rm -rf /tmp/demo');
+    expect(approvals).toHaveLength(2);
+    expect(approvals[0]?.id).toBe(approvalId);
+    expect(approvals[0]?.status).toBe('approved');
+    expect(approvals[1]?.status).toBe('pending');
+    expect(JSON.parse(readOutboundRows(sessionDir)[0]?.metadata ?? 'null').approval_id).toBe(approvals[1]?.id);
+  });
+
   it('uses the larger outbound seq candidate from the persisted ack and inbound seq', async () => {
     const sessionDir = makeTempDir('cove-v2-runner-outseq-');
     const sessionId = 'sess-outseq-1';
@@ -648,6 +893,123 @@ describe('container runner phase 5', () => {
       last_in_seq: 4,
       last_out_seq: 9,
     });
+  });
+
+  it('returns an empty string and only refreshes the heartbeat when no inbound work is pending', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-idle-heartbeat-');
+    const sessionId = 'sess-idle-heartbeat-1';
+    const outboundDb = openOutboundDb(sessionDir);
+
+    try {
+      writeProcessingAck(outboundDb, {
+        session_id: sessionId,
+        last_in_seq: 8,
+        last_out_seq: 11,
+        heartbeat_at: '2026-01-01T00:00:00.000Z',
+      });
+    } finally {
+      outboundDb.close();
+    }
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      {
+        async createSession() {
+          throw new Error('createSession should not run when the runner is idle');
+        },
+      },
+    );
+
+    expect(response).toBe('');
+    expect(readOutboundRows(sessionDir)).toEqual([]);
+    expect(readAck(sessionDir, sessionId)).toMatchObject({
+      session_id: sessionId,
+      last_in_seq: 8,
+      last_out_seq: 11,
+      heartbeat_at: expect.any(String),
+    });
+  });
+
+  it('subscribes before prompting so active flows receive synchronous text deltas', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-subscribe-before-prompt-');
+    const sessionId = 'sess-subscribe-before-prompt-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, 'Emit a synchronous delta.');
+
+    const callOrder: string[] = [];
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      {
+        async createSession() {
+          let subscriber: ((event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void) | undefined;
+
+          return {
+            session: {
+              subscribe(handler) {
+                callOrder.push('subscribe');
+                subscriber = handler;
+                return () => {
+                  callOrder.push('unsubscribe');
+                  subscriber = undefined;
+                };
+              },
+              async prompt(message) {
+                callOrder.push(`prompt:${message}`);
+                subscriber?.({
+                  type: 'message_update',
+                  assistantMessageEvent: {
+                    type: 'text_delta',
+                    delta: 'Synchronous active flow response',
+                  },
+                });
+              },
+            },
+          };
+        },
+      },
+    );
+
+    expect(response).toBe('Synchronous active flow response');
+    expect(callOrder).toEqual([
+      'subscribe',
+      'prompt:Emit a synchronous delta.',
+      'unsubscribe',
+    ]);
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 3,
+        content: 'Synchronous active flow response',
+        metadata: null,
+      },
+    ]);
   });
 
   it('passes runtime tool scope into createCoveTools and forwards custom tools into session creation', async () => {
@@ -818,6 +1180,126 @@ describe('container runner phase 5', () => {
     }));
   });
 
+  it('discovers installed extension packages through the production default resolver', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-default-extension-resolution-');
+    const projectDir = makeTempDir('cove-v2-runner-default-extension-project-');
+    const sessionId = 'sess-default-extension-resolution-1';
+    const originalCwd = process.cwd();
+    const resourceLoaders: Array<unknown> = [];
+
+    fs.mkdirSync(path.join(projectDir, 'node_modules', 'pi-mcp-adapter'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, 'node_modules', 'pi-mcp-adapter', 'package.json'),
+      JSON.stringify({ name: 'pi-mcp-adapter', type: 'module' }),
+      'utf8',
+    );
+    fs.writeFileSync(path.join(projectDir, 'node_modules', 'pi-mcp-adapter', 'index.js'), 'export {};\n', 'utf8');
+
+    fs.mkdirSync(path.join(projectDir, 'node_modules', 'pi-subagents'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, 'node_modules', 'pi-subagents', 'package.json'),
+      JSON.stringify({ name: 'pi-subagents', type: 'module' }),
+      'utf8',
+    );
+    fs.writeFileSync(path.join(projectDir, 'node_modules', 'pi-subagents', 'index.js'), 'export {};\n', 'utf8');
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey() {},
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession(sessionOptions: {
+        resourceLoader?: unknown;
+      }) {
+        resourceLoaders.push(sessionOptions.resourceLoader);
+        const listeners = new Set<(event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void>();
+
+        return {
+          session: {
+            subscribe(handler: (event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void) {
+              listeners.add(handler);
+              return () => {
+                listeners.delete(handler);
+              };
+            },
+            async prompt(message: string) {
+              for (const listener of listeners) {
+                listener({
+                  type: 'message_update',
+                  assistantMessageEvent: {
+                    type: 'text_delta',
+                    delta: `SDK:${message}`,
+                  },
+                });
+              }
+            },
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: 'group-default-extension-resolution',
+        COVE_MCP_CONFIG: JSON.stringify({
+          mcpServers: {
+            github: {
+              command: 'npx',
+              args: ['-y', '@modelcontextprotocol/server-github'],
+            },
+          },
+        }),
+      },
+    });
+    writeUserMessage(sessionDir, 'Resolve production default extensions');
+
+    process.chdir(projectDir);
+
+    try {
+      await runContainerSession({
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      });
+    } finally {
+      process.chdir(originalCwd);
+    }
+
+    expect(resourceLoaders).toContainEqual(expect.objectContaining({
+      agentDir: path.join(sessionDir, '.pi-agent'),
+      additionalExtensionPaths: [
+        fs.realpathSync(path.join(projectDir, 'node_modules', 'pi-subagents')),
+        fs.realpathSync(path.join(projectDir, 'node_modules', 'pi-mcp-adapter')),
+      ],
+    }));
+  });
+
   it('registers persona and assembled-context extension hooks for agent-group runtimes', async () => {
     const stateDir = makeTempDir('cove-v2-runner-context-state-');
     const sessionDir = path.join(stateDir, 'sessions', 'group-context-1', 'sess-context-1');
@@ -936,5 +1418,214 @@ describe('container runner phase 5', () => {
     expect(resolvedSystemPrompt).toContain('Be concise and factual.');
     expect(JSON.stringify(transformedMessages)).toContain('Earlier working note');
     expect(JSON.stringify(transformedMessages)).toContain('rollout checklist');
+  });
+
+  it('uses the real production-default setup path to create a message-scoped session', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-default-setup-');
+    const sessionId = 'sess-default-setup-1';
+
+    const promptedMessages: string[] = [];
+    const resourceLoaders: Array<unknown> = [];
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey() {},
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession(sessionOptions: {
+        model?: { provider: string; id: string };
+        sessionManager?: { mode: string; cwd?: string; sessionStateDir?: string };
+        resourceLoader?: unknown;
+      }) {
+        resourceLoaders.push(sessionOptions.resourceLoader);
+        const listeners = new Set<(event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void>();
+
+        return {
+          session: {
+            subscribe(handler: (event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void) {
+              listeners.add(handler);
+              return () => {
+                listeners.delete(handler);
+              };
+            },
+            async prompt(message: string) {
+              promptedMessages.push(message);
+
+              for (const listener of listeners) {
+                listener({
+                  type: 'message_update',
+                  assistantMessageEvent: {
+                    type: 'text_delta',
+                    delta: `SDK:${sessionOptions.model?.provider}/${sessionOptions.model?.id}:${sessionOptions.sessionManager?.mode}:${message}`,
+                  },
+                });
+              }
+            },
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+    });
+    writeUserMessage(sessionDir, 'Use the production default setup path.');
+
+    const response = await runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    });
+
+    expect(response).not.toBe('Processed: Use the production default setup path.');
+    expect(response).toBe('SDK:anthropic/claude-runner:continueRecent:Use the production default setup path.');
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 3,
+        content: response,
+        metadata: null,
+      },
+    ]);
+    expect(readAck(sessionDir, sessionId)).toMatchObject({
+      session_id: sessionId,
+      last_in_seq: 2,
+      last_out_seq: 3,
+    });
+    expect(promptedMessages).toEqual(['Use the production default setup path.']);
+    expect(resourceLoaders).toHaveLength(1);
+  });
+
+  it('reuses the same auth-backed model registry across the production default setup path', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-default-auth-registry-');
+    const sessionId = 'sess-default-auth-registry-1';
+    const authInstances: Array<{ id: string; setRuntimeApiKey(provider: string, apiKey: string): void }> = [];
+    const registryCalls: Array<{ auth: { id: string }; registry: { auth: { id: string } } }> = [];
+    const createAgentSessionCalls: Array<{
+      authStorage?: { id: string };
+      modelRegistry?: { auth: { id: string } };
+      model?: { provider: string; id: string; authId: string };
+    }> = [];
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          const auth = {
+            id: `auth-${authInstances.length + 1}`,
+            setRuntimeApiKey() {},
+          };
+          authInstances.push(auth);
+          return auth;
+        },
+      },
+      ModelRegistry: {
+        inMemory(auth: { id: string }) {
+          const registry = {
+            auth,
+            find(provider: string, model: string) {
+              return { provider, id: model, authId: auth.id };
+            },
+          };
+          registryCalls.push({ auth, registry });
+          return registry;
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession(sessionOptions: {
+        authStorage?: { id: string };
+        modelRegistry?: { auth: { id: string } };
+        model?: { provider: string; id: string; authId: string };
+      }) {
+        createAgentSessionCalls.push(sessionOptions);
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+    });
+    writeUserMessage(sessionDir, 'Verify auth-backed model registry reuse.');
+
+    await runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    });
+
+    expect(authInstances).toHaveLength(1);
+    expect(registryCalls).toHaveLength(1);
+    expect(createAgentSessionCalls).toHaveLength(1);
+    expect(createAgentSessionCalls[0]?.authStorage).toBe(authInstances[0]);
+    expect(createAgentSessionCalls[0]?.modelRegistry).toBe(registryCalls[0]?.registry);
+    expect(createAgentSessionCalls[0]?.model?.authId).toBe(authInstances[0]?.id);
+  });
+
+  it('throws setup failures without writing an assistant row or advancing ack state', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-setup-failure-');
+    const sessionId = 'sess-setup-failure-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'auto',
+      model: 'missing-provider-prefix',
+    });
+    writeUserMessage(sessionDir, 'This should fail before any outbound write.');
+
+    await expect(runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    })).rejects.toThrow("Container agent model must include an explicit provider when provider is 'auto'.");
+
+    expect(readOutboundRows(sessionDir)).toEqual([]);
+    expect(readAck(sessionDir, sessionId)).toBeNull();
   });
 });
