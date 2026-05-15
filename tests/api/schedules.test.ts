@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 
 import { createApp } from '../../src/api/app.ts';
 import { migrate } from '../../src/db/migrate.ts';
-import { setScheduleRuntimeSync } from '../../src/jobs/cron-scheduler.ts';
+import { registerRunAgentPrompt, setScheduleRuntimeSync } from '../../src/jobs/cron-scheduler.ts';
 
 type RunAgentPromptFn = (options: {
   schedule: {
@@ -63,6 +63,7 @@ async function json<T>(response: Response): Promise<T> {
 }
 
 afterEach(() => {
+  registerRunAgentPrompt(null);
   setScheduleRuntimeSync(null);
   mock.restore();
 });
@@ -448,20 +449,15 @@ describe('schedules api', () => {
     }
   });
 
-  it('returns a structured 501 payload for immediate non-agent runs', async () => {
+  it('runs workflow schedules immediately using config as workflow input', async () => {
     const db = createScheduleDb();
 
     try {
-      const runAgentPrompt = mock(async () => ({
-        content: 'unused',
-        sessionId: 'unused',
-        threadId: 'unused',
-        lastRunAt: '2026-01-15T09:00:00.000Z',
-      }));
-      const app = createApp({
-        db,
-        runAgentPrompt: runAgentPrompt as unknown as RunAgentPromptFn,
-      });
+      const workflowConfig = {
+        name: 'daily-summary',
+        notify: true,
+      };
+      const app = createApp({ db });
 
       const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
         method: 'POST',
@@ -471,6 +467,7 @@ describe('schedules api', () => {
           cron_expr: '0 9 * * *',
           prompt: 'Workflow run',
           mode: 'workflow',
+          config: workflowConfig,
         }),
       }));
       const created = await json<Record<string, unknown>>(createResponse);
@@ -479,13 +476,15 @@ describe('schedules api', () => {
         method: 'POST',
       }));
 
-      expect(runResponse.status).toBe(501);
-      expect(runAgentPrompt).not.toHaveBeenCalled();
+      expect(runResponse.status).toBe(200);
       expect(await json<Record<string, unknown>>(runResponse)).toEqual({
-        error: "Schedule mode 'workflow' is not implemented yet",
-        code: 'schedule_mode_not_implemented',
+        status: 'completed',
         schedule_id: created.id,
-        mode: 'workflow',
+        last_run_at: expect.any(String),
+        result: {
+          mode: 'workflow',
+          config: workflowConfig,
+        },
       });
 
       const persistedResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}`));
@@ -494,6 +493,172 @@ describe('schedules api', () => {
         id: created.id,
         last_run_at: expect.any(String),
         next_run_at: expect.any(String),
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('runs script schedules immediately and returns inspectable execution results', async () => {
+    const db = createScheduleDb();
+    const originalRuntime = process.env.COVE_CONTAINER_RUNTIME_BIN;
+    process.env.COVE_CONTAINER_RUNTIME_BIN = 'true';
+
+    try {
+      const app = createApp({ db });
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'printf script-result',
+          mode: 'script',
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+
+      const runResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}/run`, {
+        method: 'POST',
+      }));
+
+      expect(runResponse.status).toBe(200);
+      expect(await json<Record<string, unknown>>(runResponse)).toEqual({
+        status: 'completed',
+        schedule_id: created.id,
+        last_run_at: expect.any(String),
+        result: {
+          mode: 'script',
+          stdout: '',
+          stderr: '',
+          exit_code: 0,
+        },
+      });
+    } finally {
+      if (originalRuntime === undefined) {
+        delete process.env.COVE_CONTAINER_RUNTIME_BIN;
+      } else {
+        process.env.COVE_CONTAINER_RUNTIME_BIN = originalRuntime;
+      }
+      db.close();
+    }
+  });
+
+  it('returns a client-safe 500 when immediate script execution fails', async () => {
+    const db = createScheduleDb();
+    const originalRuntime = process.env.COVE_CONTAINER_RUNTIME_BIN;
+    process.env.COVE_CONTAINER_RUNTIME_BIN = 'false';
+
+    try {
+      const app = createApp({ db });
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'printf script-failure',
+          mode: 'script',
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+
+      const runResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}/run`, {
+        method: 'POST',
+      }));
+
+      expect(runResponse.status).toBe(500);
+      expect(await json<Record<string, unknown>>(runResponse)).toEqual({
+        error: 'Failed to run schedule',
+      });
+    } finally {
+      if (originalRuntime === undefined) {
+        delete process.env.COVE_CONTAINER_RUNTIME_BIN;
+      } else {
+        process.env.COVE_CONTAINER_RUNTIME_BIN = originalRuntime;
+      }
+      db.close();
+    }
+  });
+
+  it('runs notification schedules immediately with a completed status payload', async () => {
+    const db = createScheduleDb();
+
+    try {
+      const app = createApp({ db });
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'Notify team',
+          mode: 'notification',
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+
+      const runResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}/run`, {
+        method: 'POST',
+      }));
+
+      expect(runResponse.status).toBe(200);
+      expect(await json<Record<string, unknown>>(runResponse)).toEqual({
+        status: 'completed',
+        schedule_id: created.id,
+        last_run_at: expect.any(String),
+        result: {
+          mode: 'notification',
+          logged: true,
+        },
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('runs hybrid schedules immediately through the shared agent seam and marks them notified', async () => {
+    const db = createScheduleDb();
+
+    try {
+      const runAgentPrompt = mock(async (options: Parameters<RunAgentPromptFn>[0]) => ({
+        content: `Hybrid ${options.schedule.id}`,
+        sessionId: 'session-1',
+        threadId: `schedule:${options.schedule.id}`,
+        lastRunAt: '2026-01-15T09:00:00.000Z',
+      }));
+      const app = createApp({
+        db,
+        runAgentPrompt: runAgentPrompt as unknown as RunAgentPromptFn,
+      });
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'Hybrid run',
+          mode: 'hybrid',
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+
+      const runResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}/run`, {
+        method: 'POST',
+      }));
+
+      expect(runResponse.status).toBe(200);
+      expect(runAgentPrompt).toHaveBeenCalledTimes(1);
+      expect(await json<Record<string, unknown>>(runResponse)).toEqual({
+        status: 'completed',
+        schedule_id: created.id,
+        last_run_at: '2026-01-15T09:00:00.000Z',
+        result: {
+          content: `Hybrid ${created.id}`,
+          session_id: 'session-1',
+          thread_id: `schedule:${created.id}`,
+          notified: true,
+        },
       });
     } finally {
       db.close();

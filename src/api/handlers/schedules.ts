@@ -1,5 +1,6 @@
 import type { Database } from 'bun:sqlite';
 
+import { executeSchedule } from '../../jobs/execute-schedule.ts';
 import { getRegisteredRunAgentPrompt, removeSchedule, upsertSchedule } from '../../jobs/cron-scheduler.ts';
 import {
   createSchedule,
@@ -7,7 +8,6 @@ import {
   getSchedule,
   listSchedules,
   markScheduleRunFailed,
-  markScheduleRunNotImplemented,
   markScheduleRunSucceeded,
   updateSchedule,
   type CreateScheduleInput,
@@ -185,49 +185,45 @@ export async function handleRunSchedule(
     return jsonResponse({ error: 'Not Found' }, 404);
   }
 
-  if (schedule.mode !== 'agent') {
-    const ranAt = new Date().toISOString();
-
-    try {
-      markScheduleRunNotImplemented({
-        db: context.db,
-        id: schedule.id,
-        ranAt,
-      });
-    } catch {
-      return jsonResponse({ error: 'Failed to run schedule' }, 500);
-    }
-
-    return jsonResponse({
-      error: `Schedule mode '${schedule.mode}' is not implemented yet`,
-      code: 'schedule_mode_not_implemented',
-      schedule_id: schedule.id,
-      mode: schedule.mode,
-    }, 501);
-  }
-
-  const runAgentPrompt = context.runAgentPrompt ?? getRegisteredRunAgentPrompt();
-
-  if (runAgentPrompt == null) {
-    return jsonResponse({ error: 'Failed to run schedule' }, 500);
-  }
+  const runAgentPrompt = context.runAgentPrompt ?? getRegisteredRunAgentPrompt() ?? undefined;
 
   try {
-    const result = await runAgentPrompt({ schedule });
+    const result = await executeSchedule({ schedule, runAgentPrompt });
+    const ranAt = 'lastRunAt' in result ? result.lastRunAt : new Date().toISOString();
+
     markScheduleRunSucceeded({
       db: context.db,
       id: schedule.id,
-      ranAt: result.lastRunAt,
+      ranAt,
     });
+
+    if ('sessionId' in result) {
+      return jsonResponse({
+        status: 'completed',
+        schedule_id: schedule.id,
+        last_run_at: ranAt,
+        result: {
+          content: result.content,
+          session_id: result.sessionId,
+          thread_id: result.threadId,
+          ...('notified' in result ? { notified: true } : {}),
+        },
+      }, 200);
+    }
 
     return jsonResponse({
       status: 'completed',
       schedule_id: schedule.id,
-      last_run_at: result.lastRunAt,
+      last_run_at: ranAt,
       result: {
-        content: result.content,
-        session_id: result.sessionId,
-        thread_id: result.threadId,
+        mode: result.mode,
+        ...('logged' in result ? { logged: result.logged } : {}),
+        ...('stdout' in result ? {
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exit_code: result.exitCode,
+        } : {}),
+        ...('config' in result ? { config: result.config } : {}),
       },
     }, 200);
   } catch {

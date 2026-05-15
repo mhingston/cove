@@ -1,12 +1,11 @@
 import type { Database } from 'bun:sqlite';
 
 import type { Scheduler } from '../shared/types.ts';
+import { executeSchedule } from './execute-schedule.ts';
 import { createRunAgentPrompt } from './run-agent-prompt.ts';
 import {
-  getSchedule,
   listSchedules,
   markScheduleRunFailed,
-  markScheduleRunNotImplemented,
   markScheduleRunSucceeded,
   type ScheduleRecord,
 } from './schedules.ts';
@@ -77,7 +76,7 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
   #db: Database;
   #now: () => Date;
   #sleep: (ms: number) => Promise<void>;
-  #runAgentPrompt: RunAgentPrompt;
+  #runAgentPrompt?: RunAgentPrompt;
   #running = false;
   #loop: Promise<void> | null = null;
   #waiting: Deferred | null = null;
@@ -88,7 +87,7 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
     pollIntervalMs?: number;
     now?: () => Date;
     sleep?: (ms: number) => Promise<void>;
-    runAgentPrompt: RunAgentPrompt;
+    runAgentPrompt?: RunAgentPrompt;
   }) {
     this.#db = options.db;
     this.pollIntervalMs = options.pollIntervalMs ?? 30_000;
@@ -151,22 +150,14 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
       }
 
       try {
-        if (schedule.mode !== 'agent') {
-          markScheduleRunNotImplemented({
-            db: this.#db,
-            id: schedule.id,
-            ranAt: nowIso,
-          });
-          continue;
-        }
-
-        const result = await this.#runAgentPrompt({ schedule });
+        const result = await executeSchedule({ schedule, runAgentPrompt: this.#runAgentPrompt });
+        const ranAt = 'lastRunAt' in result ? result.lastRunAt : nowIso;
 
         try {
           markScheduleRunSucceeded({
             db: this.#db,
             id: schedule.id,
-            ranAt: result.lastRunAt,
+            ranAt,
           });
         } catch {
           continue;
@@ -214,12 +205,8 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
 }
 
 export function createScheduler(db: Database): Scheduler {
-  if (registeredRunAgentPrompt == null) {
-    throw new Error('runAgentPrompt is not initialized');
-  }
-
   return new CronScheduler({
     db,
-    runAgentPrompt: registeredRunAgentPrompt,
+    runAgentPrompt: registeredRunAgentPrompt ?? undefined,
   });
 }

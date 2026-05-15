@@ -92,6 +92,7 @@ async function waitFor(assertion: () => void | Promise<void>, attempts: number =
 }
 
 afterEach(async () => {
+  registerRunAgentPrompt(null);
   setScheduleRuntimeSync(null);
   mock.restore();
   db?.close();
@@ -129,6 +130,39 @@ describe('CronScheduler', () => {
 
     await waitFor(() => {
       expect(runAgentPrompt).toHaveBeenCalledTimes(1);
+    });
+
+    await scheduler.stop();
+  });
+
+  it('createScheduler(db) can start non-agent schedules without a registered runAgentPrompt seam', async () => {
+    db = new Database(':memory:');
+    migrate(requireDb());
+    insertAgentGroup('support');
+    const schedule = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '0 10 * * *',
+        prompt: 'Workflow summary',
+        mode: 'workflow',
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+    setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
+
+    const scheduler = createScheduler(requireDb()) as CronScheduler;
+    expect(scheduler).toBeInstanceOf(CronScheduler);
+
+    await scheduler.start();
+
+    await waitFor(() => {
+      const updated = getSchedule({ db: requireDb(), id: schedule.id });
+      expect(updated).toMatchObject({
+        id: schedule.id,
+        last_run_at: expect.any(String),
+      });
+      expect(updated?.next_run_at).not.toBe('2026-01-15T09:00:00.000Z');
     });
 
     await scheduler.stop();
@@ -340,7 +374,7 @@ describe('CronScheduler', () => {
     await scheduler.stop();
   });
 
-  it('marks due non-agent schedules as not implemented without hot-looping', async () => {
+  it('executes due workflow schedules without using the agent seam or hot-looping', async () => {
     db = new Database(':memory:');
     migrate(requireDb());
     insertAgentGroup('support');
@@ -389,6 +423,103 @@ describe('CronScheduler', () => {
     });
 
     await scheduler.stop();
+  });
+
+  it('executes due notification schedules without using the agent seam', async () => {
+    db = new Database(':memory:');
+    migrate(requireDb());
+    insertAgentGroup('support');
+    const controlledSleep = createControlledSleep();
+    const schedule = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '0 10 * * *',
+        prompt: 'Notify ops',
+        mode: 'notification',
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+    setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
+    const runAgentPrompt = mock(async () => ({
+      content: 'should not run',
+      sessionId: 'session-1',
+      threadId: `schedule:${schedule.id}`,
+      lastRunAt: '2026-01-15T09:00:00.000Z',
+    }));
+    const scheduler = new CronScheduler({
+      db: requireDb(),
+      now: () => new Date('2026-01-15T09:00:00.000Z'),
+      sleep: controlledSleep.sleep,
+      runAgentPrompt,
+    });
+
+    await scheduler.start();
+
+    await waitFor(() => {
+      expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
+        last_run_at: '2026-01-15T09:00:00.000Z',
+        next_run_at: '2026-01-15T10:00:00.000Z',
+      });
+    });
+
+    expect(runAgentPrompt).not.toHaveBeenCalled();
+
+    await scheduler.stop();
+  });
+
+  it('executes due script schedules without using the agent seam', async () => {
+    db = new Database(':memory:');
+    migrate(requireDb());
+    insertAgentGroup('support');
+    const controlledSleep = createControlledSleep();
+    const schedule = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '0 10 * * *',
+        prompt: 'printf script-result',
+        mode: 'script',
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+    setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
+    const runAgentPrompt = mock(async () => ({
+      content: 'should not run',
+      sessionId: 'session-1',
+      threadId: `schedule:${schedule.id}`,
+      lastRunAt: '2026-01-15T09:00:00.000Z',
+    }));
+    const originalRuntime = process.env.COVE_CONTAINER_RUNTIME_BIN;
+    process.env.COVE_CONTAINER_RUNTIME_BIN = 'true';
+
+    try {
+      const scheduler = new CronScheduler({
+        db: requireDb(),
+        now: () => new Date('2026-01-15T09:00:00.000Z'),
+        sleep: controlledSleep.sleep,
+        runAgentPrompt,
+      });
+
+      await scheduler.start();
+
+      await waitFor(() => {
+        expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
+          last_run_at: '2026-01-15T09:00:00.000Z',
+          next_run_at: '2026-01-15T10:00:00.000Z',
+        });
+      });
+
+      expect(runAgentPrompt).not.toHaveBeenCalled();
+
+      await scheduler.stop();
+    } finally {
+      if (originalRuntime === undefined) {
+        delete process.env.COVE_CONTAINER_RUNTIME_BIN;
+      } else {
+        process.env.COVE_CONTAINER_RUNTIME_BIN = originalRuntime;
+      }
+    }
   });
 
   it('continues operating after one agent execution failure', async () => {
