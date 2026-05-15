@@ -1728,6 +1728,76 @@ describe('container runner phase 5', () => {
     }));
   });
 
+  it('does not inject API key fallback for supported auto provider paths when inherited OneCLI gateway auth is active', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-onecli-auto-provider-');
+    const sessionId = 'sess-onecli-auto-provider-1';
+    const authCalls: Array<{ provider: string; apiKey: string | null | undefined }> = [];
+    let createAgentSessionCalls = 0;
+
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey(provider: string, apiKey: string) {
+              authCalls.push({ provider, apiKey });
+            },
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession() {
+        createAgentSessionCalls += 1;
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'auto',
+      model: 'anthropic/claude-runner',
+      api_key: 'runner-api-key',
+    });
+    writeUserMessage(sessionDir, 'Use inherited OneCLI auth for resolved provider path.');
+
+    await runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    });
+
+    expect(createAgentSessionCalls).toBe(1);
+    expect(authCalls).toEqual([]);
+  });
+
   it('does not treat persisted ONECLI config values as inherited gateway auth', async () => {
     const sessionDir = makeTempDir('cove-v2-runner-onecli-persisted-config-only-');
     const sessionId = 'sess-onecli-persisted-config-only-1';

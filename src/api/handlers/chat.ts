@@ -46,15 +46,16 @@ function writeSessionConfig(db: Database, config: SessionConfig): void {
 }
 
 function appendNewExecutableTurns(db: Database, messages: ChatMessage[]): void {
+  const executableMessages = messages.filter((message) => message.role === 'user');
   const existingRows = db.prepare('SELECT role, content FROM messages_in ORDER BY seq ASC').all() as Array<{
     role: string;
     content: string;
   }>;
   let replayPrefixLength = 0;
 
-  while (replayPrefixLength < existingRows.length && replayPrefixLength < messages.length) {
+  while (replayPrefixLength < existingRows.length && replayPrefixLength < executableMessages.length) {
     const existing = existingRows[replayPrefixLength];
-    const incoming = messages[replayPrefixLength];
+    const incoming = executableMessages[replayPrefixLength];
 
     if (existing?.role !== incoming?.role || existing?.content !== incoming?.content) {
       break;
@@ -63,11 +64,7 @@ function appendNewExecutableTurns(db: Database, messages: ChatMessage[]): void {
     replayPrefixLength += 1;
   }
 
-  for (const message of messages.slice(replayPrefixLength)) {
-    if (message.role !== 'user') {
-      continue;
-    }
-
+  for (const message of executableMessages.slice(replayPrefixLength)) {
     writeInboundMessage(db, {
       id: crypto.randomUUID(),
       role: message.role,
@@ -99,6 +96,7 @@ function materializeTranscriptContext(sessionDir: string, sessionId: string, mes
 
 function parseAgentGroupConfig(configValue: string | null): {
   api_key?: string;
+  credential_profile?: string;
   extra_env?: Record<string, string>;
 } | null {
   if (typeof configValue !== 'string' || configValue.trim() === '') {
@@ -108,6 +106,7 @@ function parseAgentGroupConfig(configValue: string | null): {
   try {
     return JSON.parse(configValue) as {
       api_key?: string;
+      credential_profile?: string;
       extra_env?: Record<string, string>;
     };
   } catch {
@@ -117,9 +116,22 @@ function parseAgentGroupConfig(configValue: string | null): {
 
 function buildSessionConfig(routed: ReturnType<typeof routeRequest>, requestBody: ChatRequestBody): SessionConfig {
   const parsedConfig = parseAgentGroupConfig(routed.agentGroup.config);
+  const hasOneCliGatewayEnv = (process.env.ONECLI_AGENT_NAME?.trim() ?? '') !== ''
+    && (process.env.ONECLI_URL?.trim() ?? '') !== '';
+  const oneCliAuthEnabled = (() => {
+    const rawValue = parsedConfig?.extra_env?.COVE_ONECLI_AUTH ?? process.env.COVE_ONECLI_AUTH;
+
+    if (rawValue == null) {
+      return true;
+    }
+
+    const normalized = rawValue.trim().toLowerCase();
+    return normalized !== '0' && normalized !== 'false' && normalized !== 'off' && normalized !== 'disabled';
+  })();
   const mcpConfig = serializeRuntimeMcpConfig(resolveRuntimeMcpConfig(parsedConfig ?? undefined)) ?? null;
   const extraEnv = {
     ...(parsedConfig?.extra_env ?? {}),
+    ...(parsedConfig?.credential_profile == null ? {} : { credential_profile: parsedConfig.credential_profile }),
     ...(mcpConfig == null ? {} : { COVE_MCP_CONFIG: mcpConfig }),
   };
 
@@ -129,7 +141,7 @@ function buildSessionConfig(routed: ReturnType<typeof routeRequest>, requestBody
       ? requestBody.provider_model.trim()
       : routed.agentGroup.model || routed.agentGroup.id,
     thinking_level: routed.agentGroup.thinking,
-    api_key: parsedConfig?.api_key ?? null,
+    api_key: oneCliAuthEnabled && hasOneCliGatewayEnv ? null : parsedConfig?.api_key ?? null,
     workspace: routed.agentGroup.workspace,
     extra_env: Object.keys(extraEnv).length > 0 ? extraEnv : null,
     permissions: routed.agentGroup.permissions,

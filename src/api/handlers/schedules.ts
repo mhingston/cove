@@ -1,7 +1,13 @@
 import type { Database } from 'bun:sqlite';
 
-import { executeSchedule } from '../../jobs/execute-schedule.ts';
-import { getRegisteredRunAgentPrompt, removeSchedule, upsertSchedule } from '../../jobs/cron-scheduler.ts';
+import { executeSchedule, hasWorkflowRollback } from '../../jobs/execute-schedule.ts';
+import {
+  getRegisteredRunAgentPrompt,
+  getRegisteredRollbackWorkflow,
+  getRegisteredStartWorkflow,
+  removeSchedule,
+  upsertSchedule,
+} from '../../jobs/cron-scheduler.ts';
 import {
   createSchedule,
   deleteSchedule,
@@ -93,6 +99,18 @@ function mapCreateOrUpdateError(error: unknown): Response {
   return jsonResponse({ error: message }, 400);
 }
 
+function isKnownCreateOrUpdateValidationError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : '';
+
+  return /^Agent group not found: /.test(message)
+    || /^Schedule not found: /.test(message)
+    || message === 'Invalid cron expression'
+    || message === 'Invalid schedule mode'
+    || message === 'config must be an object'
+    || message === 'enabled must be a boolean or 0/1'
+    || message === 'prompt must not be empty';
+}
+
 async function parseJsonBody(request: Request): Promise<unknown> {
   try {
     return await request.json();
@@ -112,7 +130,11 @@ export async function handleCreateSchedule(request: Request, db: Database): Prom
 
   try {
     const schedule = createSchedule({ db, input: payload });
-    upsertSchedule(schedule.id);
+    try {
+      upsertSchedule(schedule.id);
+    } catch {
+      // The DB write already succeeded; keep the API truthful about persisted state.
+    }
     return jsonResponse(schedule, 201);
   } catch (error) {
     return mapCreateOrUpdateError(error);
@@ -152,7 +174,11 @@ export async function handleUpdateSchedule(request: Request, db: Database, param
 
   try {
     const schedule = updateSchedule({ db, id: params.id, patch: payload });
-    upsertSchedule(schedule.id);
+    try {
+      upsertSchedule(schedule.id);
+    } catch {
+      // The DB write already succeeded; keep the API truthful about persisted state.
+    }
     return jsonResponse(schedule, 200);
   } catch (error) {
     return mapCreateOrUpdateError(error);
@@ -167,7 +193,11 @@ export function handleDeleteSchedule(_request: Request, db: Database, params: { 
       return jsonResponse({ error: 'Not Found' }, 404);
     }
 
-    removeSchedule(params.id);
+    try {
+      removeSchedule(params.id);
+    } catch {
+      // The DB delete already succeeded; keep the API truthful about persisted state.
+    }
     return new Response(null, { status: 204 });
   } catch {
     return jsonResponse({ error: 'Failed to delete schedule' }, 500);
@@ -186,16 +216,26 @@ export async function handleRunSchedule(
   }
 
   const runAgentPrompt = context.runAgentPrompt ?? getRegisteredRunAgentPrompt() ?? undefined;
+  const startWorkflow = context.startWorkflow ?? getRegisteredStartWorkflow() ?? undefined;
+  const rollbackWorkflow = context.rollbackWorkflow ?? getRegisteredRollbackWorkflow() ?? undefined;
 
   try {
-    const result = await executeSchedule({ schedule, runAgentPrompt });
+    const result = await executeSchedule({ schedule, runAgentPrompt, startWorkflow, rollbackWorkflow });
     const ranAt = 'lastRunAt' in result ? result.lastRunAt : new Date().toISOString();
 
-    markScheduleRunSucceeded({
-      db: context.db,
-      id: schedule.id,
-      ranAt,
-    });
+    try {
+      markScheduleRunSucceeded({
+        db: context.db,
+        id: schedule.id,
+        ranAt,
+      });
+    } catch {
+      if (hasWorkflowRollback(result) && result.rollbackWorkflow != null) {
+        await result.rollbackWorkflow({ instanceId: result.instanceId });
+      }
+
+      throw new Error('Failed to record schedule run');
+    }
 
     if ('sessionId' in result) {
       return jsonResponse({
@@ -215,17 +255,18 @@ export async function handleRunSchedule(
       status: 'completed',
       schedule_id: schedule.id,
       last_run_at: ranAt,
-      result: {
-        mode: result.mode,
-        ...('logged' in result ? { logged: result.logged } : {}),
-        ...('stdout' in result ? {
-          stdout: result.stdout,
-          stderr: result.stderr,
-          exit_code: result.exitCode,
-        } : {}),
-        ...('config' in result ? { config: result.config } : {}),
-      },
-    }, 200);
+        result: {
+          mode: result.mode,
+          ...('instanceId' in result ? { instance_id: result.instanceId } : {}),
+          ...('logged' in result ? { logged: result.logged } : {}),
+          ...('stdout' in result ? {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exit_code: result.exitCode,
+          } : {}),
+          ...(schedule.mode === 'workflow' ? { config: schedule.config } : {}),
+        },
+      }, 200);
   } catch {
     try {
       markScheduleRunFailed({

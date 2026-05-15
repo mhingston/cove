@@ -457,7 +457,27 @@ describe('schedules api', () => {
         name: 'daily-summary',
         notify: true,
       };
-      const app = createApp({ db });
+      const startWorkflow = mock(async (options: {
+        schedule: {
+          id: string;
+          agent_group_id: string;
+          prompt: string;
+          mode?: string;
+        };
+        input: Record<string, unknown> | null;
+      }) => {
+        expect(options.schedule).toMatchObject({
+          agent_group_id: 'support',
+          prompt: 'Workflow run',
+          mode: 'workflow',
+        });
+        expect(options.input).toEqual(workflowConfig);
+
+        return {
+          instanceId: 'workflow-instance-1',
+        };
+      });
+      const app = createApp({ db, startWorkflow });
 
       const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
         method: 'POST',
@@ -477,12 +497,14 @@ describe('schedules api', () => {
       }));
 
       expect(runResponse.status).toBe(200);
+      expect(startWorkflow).toHaveBeenCalledTimes(1);
       expect(await json<Record<string, unknown>>(runResponse)).toEqual({
         status: 'completed',
         schedule_id: created.id,
         last_run_at: expect.any(String),
         result: {
           mode: 'workflow',
+          instance_id: 'workflow-instance-1',
           config: workflowConfig,
         },
       });
@@ -493,6 +515,98 @@ describe('schedules api', () => {
         id: created.id,
         last_run_at: expect.any(String),
         next_run_at: expect.any(String),
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('rolls back a started workflow instance when schedule bookkeeping fails', async () => {
+    const db = createScheduleDb();
+
+    try {
+      const workflowConfig = {
+        name: 'daily-summary',
+      };
+      let createdId = '';
+      const startWorkflow = mock(async () => {
+        db.prepare('DELETE FROM schedules WHERE id = ?').run(createdId);
+        return {
+          instanceId: 'workflow-instance-1',
+        };
+      });
+      const rollbackWorkflow = mock(async () => {});
+      const app = createApp({ db, startWorkflow, rollbackWorkflow });
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'Workflow run',
+          mode: 'workflow',
+          config: workflowConfig,
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+      createdId = created.id as string;
+
+      const runResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${createdId}/run`, {
+        method: 'POST',
+      }));
+
+      expect(runResponse.status).toBe(500);
+      expect(await json<Record<string, unknown>>(runResponse)).toEqual({
+        error: 'Failed to run schedule',
+      });
+      expect(startWorkflow).toHaveBeenCalledTimes(1);
+      expect(rollbackWorkflow).toHaveBeenCalledWith({
+        instanceId: 'workflow-instance-1',
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('returns a client-safe 500 when workflow rollback also fails after bookkeeping failure', async () => {
+    const db = createScheduleDb();
+
+    try {
+      let createdId = '';
+      const startWorkflow = mock(async () => {
+        db.prepare('DELETE FROM schedules WHERE id = ?').run(createdId);
+        return {
+          instanceId: 'workflow-instance-1',
+        };
+      });
+      const rollbackWorkflow = mock(async () => {
+        throw new Error('rollback failed');
+      });
+      const app = createApp({ db, startWorkflow, rollbackWorkflow });
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'Workflow run',
+          mode: 'workflow',
+          config: { name: 'daily-summary' },
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+      createdId = created.id as string;
+
+      const runResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${createdId}/run`, {
+        method: 'POST',
+      }));
+
+      expect(runResponse.status).toBe(500);
+      expect(await json<Record<string, unknown>>(runResponse)).toEqual({
+        error: 'Failed to run schedule',
+      });
+      expect(rollbackWorkflow).toHaveBeenCalledWith({
+        instanceId: 'workflow-instance-1',
       });
     } finally {
       db.close();
@@ -711,6 +825,116 @@ describe('schedules api', () => {
       }));
       expect(deleteResponse.status).toBe(204);
       expect(sync.removeSchedule).toHaveBeenCalledWith(id);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('returns the created schedule when create persists but live scheduler sync fails', async () => {
+    const db = createScheduleDb();
+
+    try {
+      setScheduleRuntimeSync({
+        upsertSchedule: mock(() => {
+          throw new Error('sync failed');
+        }),
+        removeSchedule: mock(() => {}),
+      });
+      const app = createApp({ db });
+
+      const response = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'Sync me',
+        }),
+      }));
+
+      expect(response.status).toBe(201);
+      expect(await json<Record<string, unknown>>(response)).toMatchObject({
+        id: expect.any(String),
+        prompt: 'Sync me',
+      });
+      expect(await json<Array<Record<string, unknown>>>(await app.fetch(new Request('http://cove.test/v1/schedules')))).toHaveLength(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('returns the updated schedule when update persists but live scheduler sync fails', async () => {
+    const db = createScheduleDb();
+
+    try {
+      const app = createApp({ db });
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'Sync me',
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+
+      setScheduleRuntimeSync({
+        upsertSchedule: mock(() => {
+          throw new Error('sync failed');
+        }),
+        removeSchedule: mock(() => {}),
+      });
+
+      const response = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Still synced' }),
+      }));
+
+      expect(response.status).toBe(200);
+      expect(await json<Record<string, unknown>>(response)).toMatchObject({
+        id: created.id,
+        prompt: 'Still synced',
+      });
+      expect(await json<Record<string, unknown>>(await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}`)))).toMatchObject({
+        id: created.id,
+        prompt: 'Still synced',
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('returns 204 when delete persists but live scheduler sync fails', async () => {
+    const db = createScheduleDb();
+
+    try {
+      const app = createApp({ db });
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'Sync me',
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+
+      setScheduleRuntimeSync({
+        upsertSchedule: mock(() => {}),
+        removeSchedule: mock(() => {
+          throw new Error('sync failed');
+        }),
+      });
+
+      const response = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}`, {
+        method: 'DELETE',
+      }));
+
+      expect(response.status).toBe(204);
+      expect((await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}`))).status).toBe(404);
     } finally {
       db.close();
     }

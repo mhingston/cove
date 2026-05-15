@@ -1,4 +1,5 @@
 import type { Database } from 'bun:sqlite';
+import type { ScheduleRecord } from '../jobs/schedules.ts';
 
 export type AgentGroupSummaryRow = {
   id: string;
@@ -182,8 +183,21 @@ export type ScheduleRunAgentPrompt = (options: {
   lastRunAt: string;
 }>;
 
+export type ScheduleStartWorkflow = (options: {
+  schedule: ScheduleRecord;
+  input: Record<string, unknown> | null;
+}) => Promise<{
+  instanceId: string;
+}>;
+
+export type ScheduleRollbackWorkflow = (options: {
+  instanceId: string;
+}) => Promise<void>;
+
 export type AppContext = {
   db: Database;
   chat?: ChatHandlerContext;
   runAgentPrompt?: ScheduleRunAgentPrompt;
+  startWorkflow?: ScheduleStartWorkflow;
+  rollbackWorkflow?: ScheduleRollbackWorkflow;
 };

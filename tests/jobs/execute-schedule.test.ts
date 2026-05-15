@@ -30,6 +30,46 @@ afterEach(() => {
 });
 
 describe('executeSchedule', () => {
+  it('starts workflow schedules using config as workflow input', async () => {
+    const schedule = createSchedule({
+      mode: 'workflow',
+      config: {
+        workflow: 'daily-summary',
+        notify: true,
+      },
+    });
+    const startWorkflow = async ({ schedule: startedSchedule, input }: {
+      schedule: ScheduleRecord;
+      input: Record<string, unknown> | null;
+    }) => {
+      expect(startedSchedule).toBe(schedule);
+      expect(input).toEqual(schedule.config);
+
+      return {
+        instanceId: 'workflow-instance-1',
+      };
+    };
+
+    await expect(executeSchedule({
+      schedule,
+      startWorkflow,
+    })).resolves.toEqual({
+      mode: 'workflow',
+      instanceId: 'workflow-instance-1',
+    });
+  });
+
+  it('throws when a workflow schedule is missing the workflow starter dependency', async () => {
+    await expect(executeSchedule({
+      schedule: createSchedule({
+        mode: 'workflow',
+        config: {
+          workflow: 'daily-summary',
+        },
+      }),
+    })).rejects.toThrow('startWorkflow is required for workflow schedules');
+  });
+
   it('throws when a script schedule exits non-zero', async () => {
     process.env.COVE_CONTAINER_RUNTIME_BIN = 'false';
 

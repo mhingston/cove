@@ -12,7 +12,9 @@ import { startSweep as startDefaultSweep } from './host-sweep.ts';
 import { resolveRuntimeMcpConfig, serializeRuntimeMcpConfig } from './integrations/mcp.ts';
 import {
   createScheduler as createDefaultScheduler,
+  registerRollbackWorkflow,
   registerRunAgentPrompt,
+  registerStartWorkflow,
   setScheduleRuntimeSync,
   type SchedulerRuntimeSync,
 } from './jobs/cron-scheduler.ts';
@@ -22,8 +24,11 @@ import { pollForResponse } from './delivery.ts';
 import { openInboundDb, writeInboundMessage } from './session/inbound.ts';
 import { openOutboundDb } from './session/outbound.ts';
 import { createEnsureSessionRuntime } from './session/runtime.ts';
+import { createWorkflowRuntime as createDefaultWorkflowRuntime, type WorkflowRuntime } from './workflows/runtime.ts';
 import type { ApiServer, Scheduler, SweepHandle, WarmPool } from './shared/types.ts';
 import type { ChatHandlerContext, ChatMessage, SessionConfig } from './shared/types.ts';
+import type { ScheduleRollbackWorkflow } from './shared/types.ts';
+import type { ScheduleStartWorkflow } from './shared/types.ts';
 import { createWarmPool as createDefaultWarmPool } from './warm-pool.ts';
 
 export type BootRuntime = {
@@ -35,9 +40,15 @@ export type BootDependencies = {
   migrate(db: Database): void;
   cleanupOrphans(): Promise<void>;
   createWarmPool(db: Database): WarmPool;
+  createWorkflowRuntime(databasePath: string): WorkflowRuntime;
   createScheduler(db: Database): Scheduler;
   startSweep(db: Database): SweepHandle;
-  startApiServer(options: { db: Database; chat?: ChatHandlerContext }): ApiServer;
+  startApiServer(options: {
+    db: Database;
+    chat?: ChatHandlerContext;
+    startWorkflow?: ScheduleStartWorkflow;
+    rollbackWorkflow?: ScheduleRollbackWorkflow;
+  }): ApiServer;
 };
 
 function createNoopSweepHandle(): SweepHandle {
@@ -90,8 +101,13 @@ function createScheduler(db: Database): Scheduler {
   return createDefaultScheduler(db);
 }
 
+function createWorkflowRuntime(databasePath: string): WorkflowRuntime {
+  return createDefaultWorkflowRuntime(databasePath);
+}
+
 function parseAgentGroupConfig(configValue: string | null): {
   api_key?: string;
+  credential_profile?: string;
   extra_env?: Record<string, string>;
 } | null {
   if (typeof configValue !== 'string' || configValue.trim() === '') {
@@ -101,6 +117,7 @@ function parseAgentGroupConfig(configValue: string | null): {
   try {
     return JSON.parse(configValue) as {
       api_key?: string;
+      credential_profile?: string;
       extra_env?: Record<string, string>;
     };
   } catch {
@@ -118,9 +135,22 @@ function buildScheduledSessionConfig(agentGroup: {
   config: string | null;
 }): SessionConfig {
   const parsedConfig = parseAgentGroupConfig(agentGroup.config);
+  const hasOneCliGatewayEnv = (process.env.ONECLI_AGENT_NAME?.trim() ?? '') !== ''
+    && (process.env.ONECLI_URL?.trim() ?? '') !== '';
+  const oneCliAuthEnabled = (() => {
+    const rawValue = parsedConfig?.extra_env?.COVE_ONECLI_AUTH ?? process.env.COVE_ONECLI_AUTH;
+
+    if (rawValue == null) {
+      return true;
+    }
+
+    const normalized = rawValue.trim().toLowerCase();
+    return normalized !== '0' && normalized !== 'false' && normalized !== 'off' && normalized !== 'disabled';
+  })();
   const mcpConfig = serializeRuntimeMcpConfig(resolveRuntimeMcpConfig(parsedConfig ?? undefined)) ?? null;
   const extraEnv = {
     ...(parsedConfig?.extra_env ?? {}),
+    ...(parsedConfig?.credential_profile == null ? {} : { credential_profile: parsedConfig.credential_profile }),
     ...(mcpConfig == null ? {} : { COVE_MCP_CONFIG: mcpConfig }),
   };
 
@@ -128,7 +158,7 @@ function buildScheduledSessionConfig(agentGroup: {
     provider: agentGroup.provider,
     model: agentGroup.model || agentGroup.id,
     thinking_level: agentGroup.thinking,
-    api_key: parsedConfig?.api_key ?? null,
+    api_key: oneCliAuthEnabled && hasOneCliGatewayEnv ? null : parsedConfig?.api_key ?? null,
     workspace: agentGroup.workspace,
     extra_env: Object.keys(extraEnv).length > 0 ? extraEnv : null,
     permissions: agentGroup.permissions,
@@ -274,6 +304,7 @@ const defaultDependencies: BootDependencies = {
   migrate,
   cleanupOrphans,
   createWarmPool,
+  createWorkflowRuntime,
   createScheduler,
   startSweep,
   startApiServer,
@@ -311,6 +342,14 @@ export async function boot(overrides: Partial<BootDependencies> = {}): Promise<B
     cleanupActions.unshift(() => warmPool.stop());
     await warmPool.start();
 
+    const workflowRuntime = dependencies.createWorkflowRuntime(path.join(getStateDir(), 'workflows.db'));
+    cleanupActions.unshift(() => workflowRuntime.stop());
+    await workflowRuntime.start();
+    registerStartWorkflow(workflowRuntime.startWorkflow);
+    cleanupActions.unshift(() => registerStartWorkflow(null));
+    registerRollbackWorkflow(workflowRuntime.rollbackWorkflow);
+    cleanupActions.unshift(() => registerRollbackWorkflow(null));
+
     const ensureSessionRuntime = createEnsureSessionRuntime({
       db,
       warmPool,
@@ -340,6 +379,8 @@ export async function boot(overrides: Partial<BootDependencies> = {}): Promise<B
     const apiServer = dependencies.startApiServer({
       db,
       chat: { ensureSessionRuntime },
+      startWorkflow: workflowRuntime.startWorkflow,
+      rollbackWorkflow: workflowRuntime.rollbackWorkflow,
     });
     cleanupActions.unshift(() => apiServer.stop());
 

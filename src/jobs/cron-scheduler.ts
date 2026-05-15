@@ -1,7 +1,8 @@
 import type { Database } from 'bun:sqlite';
 
 import type { Scheduler } from '../shared/types.ts';
-import { executeSchedule } from './execute-schedule.ts';
+import type { ScheduleRollbackWorkflow, ScheduleStartWorkflow } from '../shared/types.ts';
+import { executeSchedule, hasWorkflowRollback } from './execute-schedule.ts';
 import { createRunAgentPrompt } from './run-agent-prompt.ts';
 import {
   listSchedules,
@@ -49,6 +50,8 @@ function compareSchedules(left: ScheduleRecord, right: ScheduleRecord): number {
 
 let scheduleRuntimeSync: SchedulerRuntimeSync | null = null;
 let registeredRunAgentPrompt: RunAgentPrompt | null = null;
+let registeredStartWorkflow: ScheduleStartWorkflow | null = null;
+let registeredRollbackWorkflow: ScheduleRollbackWorkflow | null = null;
 
 export function setScheduleRuntimeSync(sync: SchedulerRuntimeSync | null): void {
   scheduleRuntimeSync = sync;
@@ -60,6 +63,22 @@ export function registerRunAgentPrompt(runAgentPrompt: RunAgentPrompt | null): v
 
 export function getRegisteredRunAgentPrompt(): RunAgentPrompt | null {
   return registeredRunAgentPrompt;
+}
+
+export function registerStartWorkflow(startWorkflow: ScheduleStartWorkflow | null): void {
+  registeredStartWorkflow = startWorkflow;
+}
+
+export function getRegisteredStartWorkflow(): ScheduleStartWorkflow | null {
+  return registeredStartWorkflow;
+}
+
+export function registerRollbackWorkflow(rollbackWorkflow: ScheduleRollbackWorkflow | null): void {
+  registeredRollbackWorkflow = rollbackWorkflow;
+}
+
+export function getRegisteredRollbackWorkflow(): ScheduleRollbackWorkflow | null {
+  return registeredRollbackWorkflow;
 }
 
 export function upsertSchedule(id: string): void {
@@ -77,6 +96,8 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
   #now: () => Date;
   #sleep: (ms: number) => Promise<void>;
   #runAgentPrompt?: RunAgentPrompt;
+  #startWorkflow?: ScheduleStartWorkflow;
+  #rollbackWorkflow?: ScheduleRollbackWorkflow;
   #running = false;
   #loop: Promise<void> | null = null;
   #waiting: Deferred | null = null;
@@ -88,12 +109,16 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
     now?: () => Date;
     sleep?: (ms: number) => Promise<void>;
     runAgentPrompt?: RunAgentPrompt;
+    startWorkflow?: ScheduleStartWorkflow;
+    rollbackWorkflow?: ScheduleRollbackWorkflow;
   }) {
     this.#db = options.db;
     this.pollIntervalMs = options.pollIntervalMs ?? 30_000;
     this.#now = options.now ?? (() => new Date());
     this.#sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
     this.#runAgentPrompt = options.runAgentPrompt;
+    this.#startWorkflow = options.startWorkflow;
+    this.#rollbackWorkflow = options.rollbackWorkflow;
   }
 
   async start(): Promise<void> {
@@ -150,8 +175,13 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
       }
 
       try {
-        const result = await executeSchedule({ schedule, runAgentPrompt: this.#runAgentPrompt });
-        const ranAt = 'lastRunAt' in result ? result.lastRunAt : nowIso;
+        const result = await executeSchedule({
+          schedule,
+          runAgentPrompt: this.#runAgentPrompt,
+          startWorkflow: this.#startWorkflow,
+          rollbackWorkflow: this.#rollbackWorkflow,
+        });
+        const ranAt = 'lastRunAt' in result ? result.lastRunAt : this.#now().toISOString();
 
         try {
           markScheduleRunSucceeded({
@@ -160,14 +190,28 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
             ranAt,
           });
         } catch {
-          continue;
+          if (hasWorkflowRollback(result) && result.rollbackWorkflow != null) {
+            try {
+              await result.rollbackWorkflow({ instanceId: result.instanceId });
+            } catch {}
+          }
+
+          try {
+            markScheduleRunFailed({
+              db: this.#db,
+              id: schedule.id,
+              ranAt: this.#now().toISOString(),
+            });
+          } catch {
+            continue;
+          }
         }
       } catch {
         try {
           markScheduleRunFailed({
             db: this.#db,
             id: schedule.id,
-            ranAt: nowIso,
+            ranAt: this.#now().toISOString(),
           });
         } catch {
           continue;
@@ -208,5 +252,7 @@ export function createScheduler(db: Database): Scheduler {
   return new CronScheduler({
     db,
     runAgentPrompt: registeredRunAgentPrompt ?? undefined,
+    startWorkflow: registeredStartWorkflow ?? undefined,
+    rollbackWorkflow: registeredRollbackWorkflow ?? undefined,
   });
 }

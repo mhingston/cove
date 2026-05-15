@@ -29,6 +29,8 @@ import { completeStreamRelay, failStreamRelay, pushStreamRelayChunk } from '../s
 import type { ApiServer } from '../shared/types.ts';
 import type { AppContext } from '../shared/types.ts';
 import type { ChatHandlerContext } from '../shared/types.ts';
+import type { ScheduleRollbackWorkflow } from '../shared/types.ts';
+import type { ScheduleStartWorkflow } from '../shared/types.ts';
 
 type ApiRoute = {
   method: string;
@@ -252,10 +254,21 @@ export function routeApiRequest(
   return Response.json({ error: 'Not Found' }, { status: 404 });
 }
 
-export function startApiServer(options: { db: Database; port?: number; chat?: ChatHandlerContext }): ApiServer {
+export function startApiServer(options: {
+  db: Database;
+  port?: number;
+  chat?: ChatHandlerContext;
+  startWorkflow?: ScheduleStartWorkflow;
+  rollbackWorkflow?: ScheduleRollbackWorkflow;
+}): ApiServer {
   const requestedPort = options.port ?? resolvePort();
   const hostname = '127.0.0.1';
-  const context: AppContext = { db: options.db, chat: options.chat };
+  const context: AppContext = {
+    db: options.db,
+    chat: options.chat,
+    startWorkflow: options.startWorkflow,
+    rollbackWorkflow: options.rollbackWorkflow,
+  };
 
   const server = Bun.serve({
     hostname,

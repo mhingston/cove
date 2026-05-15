@@ -309,6 +309,150 @@ describe('chat completions api', () => {
     }
   });
 
+  it('does not persist raw api_key into session_config when OneCLI-backed auth is enabled', async () => {
+    const stateDir = makeStateDir();
+    process.env.COVE_STATE_DIR = stateDir;
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+
+    const db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup(db, {
+      id: 'chat-group-1',
+      config: JSON.stringify({
+        api_key: 'sk-chat-test',
+        credential_profile: 'onecli-default',
+      }),
+    });
+
+    try {
+      const response = await createApp({
+        db,
+        chat: {
+          async pollForResponse(): Promise<OutboundMessageRow[]> {
+            return [
+              {
+                id: 'assistant-2',
+                seq: 3,
+                role: 'assistant',
+                content: 'Configured reply',
+                finish_reason: 'stop',
+                tool_calls: null,
+                metadata: null,
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ];
+          },
+        },
+      }).fetch(
+        new Request('http://cove.test/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            agent_group_id: 'chat-group-1',
+            thread_id: 'thread-onecli',
+            messages: [{ role: 'user', content: 'Hello from the user' }],
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+
+      const sessionRow = db
+        .prepare('SELECT id, session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?')
+        .get('chat-group-1', 'thread-onecli') as { id: string; session_file: string | null };
+      const inboundDb = new Database(path.join(sessionRow.session_file!, 'inbound.db'));
+
+      try {
+        const configRow = inboundDb.prepare(
+          'SELECT api_key, extra_env FROM session_config',
+        ).get() as {
+          api_key: string | null;
+          extra_env: string | null;
+        };
+
+        expect(configRow.api_key).toBeNull();
+        expect(configRow.extra_env).toContain('credential_profile');
+      } finally {
+        inboundDb.close();
+      }
+    } finally {
+      delete process.env.ONECLI_AGENT_NAME;
+      delete process.env.ONECLI_URL;
+      db.close();
+    }
+  });
+
+  it('does not duplicate executable user turns when a mixed-role transcript is replayed', async () => {
+    const stateDir = makeStateDir();
+    process.env.COVE_STATE_DIR = stateDir;
+
+    const db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup(db, { id: 'chat-group-1' });
+
+    try {
+      const app = createApp({
+        db,
+        chat: {
+          async pollForResponse(): Promise<OutboundMessageRow[]> {
+            return [
+              {
+                id: 'assistant-2',
+                seq: 3,
+                role: 'assistant',
+                content: 'Configured reply',
+                finish_reason: 'stop',
+                tool_calls: null,
+                metadata: null,
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+            ];
+          },
+        },
+      });
+
+      const createRequest = () => new Request('http://cove.test/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'chat-group-1',
+          thread_id: 'thread-mixed-replay',
+          messages: [
+            { role: 'assistant', content: 'Previously answered' },
+            { role: 'user', content: 'Hello from the user' },
+          ],
+        }),
+      });
+
+      expect((await app.fetch(createRequest())).status).toBe(200);
+      expect((await app.fetch(createRequest())).status).toBe(200);
+
+      const sessionRow = db
+        .prepare('SELECT session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?')
+        .get('chat-group-1', 'thread-mixed-replay') as { session_file: string | null };
+      const inboundDb = new Database(path.join(sessionRow.session_file!, 'inbound.db'));
+
+      try {
+        const inboundRows = inboundDb.prepare(
+          'SELECT seq, role, content FROM messages_in ORDER BY seq ASC',
+        ).all() as Array<{ seq: number; role: string; content: string }>;
+
+        expect(inboundRows).toEqual([
+          {
+            seq: 2,
+            role: 'user',
+            content: 'Hello from the user',
+          },
+        ]);
+      } finally {
+        inboundDb.close();
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   it('returns the verified assistant response and preserves metadata', async () => {
     const stateDir = makeStateDir();
     process.env.COVE_STATE_DIR = stateDir;

@@ -6,6 +6,7 @@ import {
   CronScheduler,
   createScheduler,
   registerRunAgentPrompt,
+  registerStartWorkflow,
   removeSchedule,
   setScheduleRuntimeSync,
   upsertSchedule,
@@ -93,6 +94,7 @@ async function waitFor(assertion: () => void | Promise<void>, attempts: number =
 
 afterEach(async () => {
   registerRunAgentPrompt(null);
+  registerStartWorkflow(null);
   setScheduleRuntimeSync(null);
   mock.restore();
   db?.close();
@@ -135,7 +137,7 @@ describe('CronScheduler', () => {
     await scheduler.stop();
   });
 
-  it('createScheduler(db) can start non-agent schedules without a registered runAgentPrompt seam', async () => {
+  it('createScheduler(db) uses the registered shared workflow starter seam', async () => {
     db = new Database(':memory:');
     migrate(requireDb());
     insertAgentGroup('support');
@@ -150,19 +152,34 @@ describe('CronScheduler', () => {
       now: '2026-01-15T08:00:00.000Z',
     });
     setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
+    const startWorkflow = mock(async (input: {
+      schedule: { id: string; agent_group_id: string; prompt: string; mode?: string; config?: Record<string, unknown> | null };
+      input: Record<string, unknown> | null;
+    }) => {
+      expect(input.input).toEqual(null);
+      expect(input.schedule).toMatchObject({
+        id: schedule.id,
+        prompt: 'Workflow summary',
+        mode: 'workflow',
+      });
 
+      return {
+        instanceId: 'workflow-instance-1',
+      };
+    });
+
+    registerStartWorkflow(startWorkflow);
     const scheduler = createScheduler(requireDb()) as CronScheduler;
     expect(scheduler).toBeInstanceOf(CronScheduler);
 
     await scheduler.start();
 
     await waitFor(() => {
-      const updated = getSchedule({ db: requireDb(), id: schedule.id });
-      expect(updated).toMatchObject({
+      expect(startWorkflow).toHaveBeenCalledTimes(1);
+      expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
         id: schedule.id,
         last_run_at: expect.any(String),
       });
-      expect(updated?.next_run_at).not.toBe('2026-01-15T09:00:00.000Z');
     });
 
     await scheduler.stop();
@@ -386,6 +403,9 @@ describe('CronScheduler', () => {
         cron_expr: '0 10 * * *',
         prompt: 'Workflow summary',
         mode: 'workflow',
+        config: {
+          workflow: 'daily-summary',
+        },
       },
       now: '2026-01-15T08:00:00.000Z',
     });
@@ -396,11 +416,29 @@ describe('CronScheduler', () => {
       threadId: `schedule:${schedule.id}`,
       lastRunAt: '2026-01-15T09:00:00.000Z',
     }));
+    const startWorkflow = mock(async (input: {
+      schedule: { id: string; agent_group_id: string; prompt: string; mode?: string; config?: Record<string, unknown> | null };
+      input: Record<string, unknown> | null;
+    }) => {
+      expect(input.input).toEqual({
+        workflow: 'daily-summary',
+      });
+      expect(input.schedule).toMatchObject({
+        id: schedule.id,
+        prompt: 'Workflow summary',
+        mode: 'workflow',
+      });
+
+      return {
+        instanceId: 'workflow-instance-1',
+      };
+    });
     const scheduler = new CronScheduler({
       db: requireDb(),
       now: () => new Date('2026-01-15T09:00:00.000Z'),
       sleep: controlledSleep.sleep,
       runAgentPrompt,
+      startWorkflow,
     });
     setScheduleRuntimeSync(scheduler);
 
@@ -417,9 +455,208 @@ describe('CronScheduler', () => {
     await Promise.resolve();
 
     expect(runAgentPrompt).not.toHaveBeenCalled();
+    expect(startWorkflow).toHaveBeenCalledTimes(1);
     expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
       last_run_at: '2026-01-15T09:00:00.000Z',
       next_run_at: '2026-01-15T10:00:00.000Z',
+    });
+
+    await scheduler.stop();
+  });
+
+  it('records workflow runs using the completion timestamp after a slow start', async () => {
+    db = new Database(':memory:');
+    migrate(requireDb());
+    insertAgentGroup('support');
+    const controlledSleep = createControlledSleep();
+    const schedule = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '*/5 * * * *',
+        prompt: 'Workflow summary',
+        mode: 'workflow',
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+    setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
+    let currentTime = '2026-01-15T09:00:00.000Z';
+    const startWorkflow = mock(async () => {
+      currentTime = '2026-01-15T09:03:00.000Z';
+      return {
+        instanceId: 'workflow-instance-1',
+      };
+    });
+    const scheduler = new CronScheduler({
+      db: requireDb(),
+      now: () => new Date(currentTime),
+      sleep: controlledSleep.sleep,
+      startWorkflow,
+    });
+
+    await scheduler.start();
+
+    await waitFor(() => {
+      expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
+        last_run_at: '2026-01-15T09:03:00.000Z',
+        next_run_at: '2026-01-15T09:05:00.000Z',
+      });
+    });
+
+    expect(startWorkflow).toHaveBeenCalledTimes(1);
+
+    await scheduler.stop();
+  });
+
+  it('rolls back a started workflow instance when schedule bookkeeping fails', async () => {
+    db = new Database(':memory:');
+    migrate(requireDb());
+    insertAgentGroup('support');
+    const controlledSleep = createControlledSleep();
+    const schedule = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '0 10 * * *',
+        prompt: 'Workflow summary',
+        mode: 'workflow',
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+    setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
+    const rollbackWorkflow = mock(async () => {});
+    const startWorkflow = mock(async () => {
+      requireDb().prepare('DELETE FROM schedules WHERE id = ?').run(schedule.id);
+      return {
+        instanceId: 'workflow-instance-1',
+      };
+    });
+    const scheduler = new CronScheduler({
+      db: requireDb(),
+      now: () => new Date('2026-01-15T09:00:00.000Z'),
+      sleep: controlledSleep.sleep,
+      startWorkflow,
+      rollbackWorkflow,
+    });
+
+    await scheduler.start();
+
+    await waitFor(() => {
+      expect(startWorkflow).toHaveBeenCalledTimes(1);
+      expect(rollbackWorkflow).toHaveBeenCalledWith({
+        instanceId: 'workflow-instance-1',
+      });
+    });
+
+    await scheduler.stop();
+  });
+
+  it('records failed workflow runs using the failure timestamp after a slow start failure', async () => {
+    db = new Database(':memory:');
+    migrate(requireDb());
+    insertAgentGroup('support');
+    const controlledSleep = createControlledSleep();
+    const schedule = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '*/5 * * * *',
+        prompt: 'Workflow summary',
+        mode: 'workflow',
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+    setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
+    let currentTime = '2026-01-15T09:00:00.000Z';
+    const startWorkflow = mock(async () => {
+      currentTime = '2026-01-15T09:03:00.000Z';
+      throw new Error('workflow failed');
+    });
+    const scheduler = new CronScheduler({
+      db: requireDb(),
+      now: () => new Date(currentTime),
+      sleep: controlledSleep.sleep,
+      startWorkflow,
+    });
+
+    await scheduler.start();
+
+    await waitFor(() => {
+      expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
+        last_run_at: '2026-01-15T09:03:00.000Z',
+        next_run_at: '2026-01-15T09:05:00.000Z',
+      });
+    });
+
+    await scheduler.stop();
+  });
+
+  it('continues scheduling when workflow rollback itself fails', async () => {
+    db = new Database(':memory:');
+    migrate(requireDb());
+    insertAgentGroup('support');
+    const controlledSleep = createControlledSleep();
+    const failing = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '0 10 * * *',
+        prompt: 'Workflow summary',
+        mode: 'workflow',
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+    const succeeding = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '0 10 * * *',
+        prompt: 'Runs later',
+      },
+      now: '2026-01-15T08:05:00.000Z',
+    });
+    setNextRunAt(failing.id, '2026-01-15T09:00:00.000Z');
+    const rollbackWorkflow = mock(async () => {
+      throw new Error('rollback failed');
+    });
+    const startWorkflow = mock(async () => {
+      requireDb().prepare('DELETE FROM schedules WHERE id = ?').run(failing.id);
+      return {
+        instanceId: 'workflow-instance-1',
+      };
+    });
+    const runAgentPrompt = mock(async (input: { schedule: { id: string } }) => ({
+      content: 'ok',
+      sessionId: 'session-2',
+      threadId: `schedule:${input.schedule.id}`,
+      lastRunAt: '2026-01-15T09:00:00.000Z',
+    }));
+    const scheduler = new CronScheduler({
+      db: requireDb(),
+      now: () => new Date('2026-01-15T09:00:00.000Z'),
+      sleep: controlledSleep.sleep,
+      startWorkflow,
+      rollbackWorkflow,
+      runAgentPrompt,
+    });
+    setScheduleRuntimeSync(scheduler);
+
+    await scheduler.start();
+
+    await waitFor(() => {
+      expect(startWorkflow).toHaveBeenCalledTimes(1);
+      expect(rollbackWorkflow).toHaveBeenCalledWith({ instanceId: 'workflow-instance-1' });
+    });
+
+    setNextRunAt(succeeding.id, '2026-01-15T09:00:00.000Z');
+    upsertSchedule(succeeding.id);
+
+    await waitFor(() => {
+      expect(runAgentPrompt).toHaveBeenCalledTimes(1);
+      expect(getSchedule({ db: requireDb(), id: succeeding.id })).toMatchObject({
+        last_run_at: '2026-01-15T09:00:00.000Z',
+        next_run_at: '2026-01-15T10:00:00.000Z',
+      });
     });
 
     await scheduler.stop();

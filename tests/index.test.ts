@@ -116,6 +116,129 @@ async function bootWithDefaultWarmPool(options: {
 }
 
 describe('boot sequence', () => {
+  it('starts one host-owned workflow runtime against the state-dir database and stops it on shutdown', async () => {
+    const steps: string[] = [];
+    const db = {
+      close() {
+        steps.push('db.close');
+      },
+    } as unknown as Database;
+
+    process.env.COVE_STATE_DIR = '/tmp/cove-v2-workflow-runtime';
+
+    const runtime = await boot({
+      getDb() {
+        steps.push('db.get');
+        return db;
+      },
+      migrate() {
+        steps.push('db.migrate');
+      },
+      async cleanupOrphans() {
+        steps.push('cleanup.orphans');
+      },
+      createWarmPool() {
+        steps.push('warm-pool.init');
+        return {
+          async start() {
+            steps.push('warm-pool.start');
+          },
+          async stop() {
+            steps.push('warm-pool.stop');
+          },
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      createWorkflowRuntime(databasePath) {
+        steps.push(`workflow-runtime.init:${databasePath}`);
+        return {
+          async start() {
+            steps.push('workflow-runtime.start');
+          },
+          async stop() {
+            steps.push('workflow-runtime.stop');
+          },
+          async startWorkflow() {
+            return { instanceId: 'workflow-instance-1' };
+          },
+          async rollbackWorkflow() {},
+        };
+      },
+      createScheduler() {
+        steps.push('scheduler.init');
+        return {
+          async start() {
+            steps.push('scheduler.start');
+          },
+          async stop() {
+            steps.push('scheduler.stop');
+          },
+        };
+      },
+      startSweep() {
+        steps.push('sweep.start');
+        return {
+          async stop() {
+            steps.push('sweep.stop');
+          },
+        };
+      },
+      startApiServer() {
+        steps.push('api.start');
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {
+            steps.push('api.stop');
+          },
+        };
+      },
+    });
+
+    expect(steps).toEqual([
+      'db.get',
+      'db.migrate',
+      'cleanup.orphans',
+      'warm-pool.init',
+      'warm-pool.start',
+      'workflow-runtime.init:/tmp/cove-v2-workflow-runtime/workflows.db',
+      'workflow-runtime.start',
+      'scheduler.init',
+      'scheduler.start',
+      'sweep.start',
+      'api.start',
+    ]);
+
+    await runtime.stop();
+
+    expect(steps).toEqual([
+      'db.get',
+      'db.migrate',
+      'cleanup.orphans',
+      'warm-pool.init',
+      'warm-pool.start',
+      'workflow-runtime.init:/tmp/cove-v2-workflow-runtime/workflows.db',
+      'workflow-runtime.start',
+      'scheduler.init',
+      'scheduler.start',
+      'sweep.start',
+      'api.start',
+      'api.stop',
+      'sweep.stop',
+      'scheduler.stop',
+      'workflow-runtime.stop',
+      'warm-pool.stop',
+      'db.close',
+    ]);
+  });
+
   it('starts the Phase 1 services in order', async () => {
     const steps: string[] = [];
     const db = {
@@ -764,8 +887,16 @@ mock.module('../src/jobs/cron-scheduler.ts', () => ({
   getRegisteredRunAgentPrompt() {
     return null;
   },
+  getRegisteredRollbackWorkflow() {
+    return null;
+  },
+  getRegisteredStartWorkflow() {
+    return null;
+  },
   removeSchedule() {},
+  registerRollbackWorkflow() {},
   registerRunAgentPrompt() {},
+  registerStartWorkflow() {},
   setScheduleRuntimeSync(sync) {
     events.push(sync == null ? 'sync.clear' : 'sync.set');
   },
@@ -894,10 +1025,18 @@ mock.module('../src/jobs/cron-scheduler.ts', () => ({
   getRegisteredRunAgentPrompt() {
     return null;
   },
+  getRegisteredRollbackWorkflow() {
+    return null;
+  },
+  getRegisteredStartWorkflow() {
+    return null;
+  },
   removeSchedule() {},
+  registerRollbackWorkflow() {},
   registerRunAgentPrompt(runAgentPrompt) {
     registerRunAgentPromptArgs = runAgentPrompt;
   },
+  registerStartWorkflow() {},
   setScheduleRuntimeSync() {},
   upsertSchedule() {},
 }));
@@ -949,6 +1088,126 @@ describe('default scheduler runAgentPrompt isolation', () => {
       expect(ensureSessionRuntimeArgs).toMatchObject({ db });
       expect(registerRunAgentPromptArgs).toBe(sharedRunAgentPrompt);
       expect(createSchedulerArgs).toEqual({ db });
+    } finally {
+      await runtime.stop();
+    }
+  });
+});
+`;
+
+    fs.writeFileSync(tempTestPath, tempTestSource);
+
+    const result = Bun.spawnSync(['bun', 'test', tempTestPath], {
+      cwd: path.dirname(import.meta.dir),
+      env: process.env,
+      stderr: 'pipe',
+      stdout: 'pipe',
+    });
+
+    try {
+      const output = result.stdout.toString() + result.stderr.toString();
+      expect(result.exitCode, output).toBe(0);
+      expect(output).toContain('1 pass');
+    } finally {
+      fs.rmSync(tempTestPath, { force: true });
+    }
+  });
+
+  it('registers the shared workflow starter during boot and passes it into the API server', async () => {
+    const tempTestPath = path.join(
+      path.dirname(import.meta.path),
+      `.workflow-runtime-boot-${crypto.randomUUID()}.test.ts`,
+    );
+    const tempTestSource = `
+import { describe, expect, it, mock } from 'bun:test';
+import { Database } from 'bun:sqlite';
+
+let registerStartWorkflowArgs;
+let startApiServerArgs;
+const sharedStartWorkflow = async () => ({ instanceId: 'workflow-instance-1' });
+
+mock.module('../src/jobs/cron-scheduler.ts', () => ({
+  createScheduler() {
+    return {
+      upsertSchedule() {},
+      removeSchedule() {},
+      async start() {},
+      async stop() {},
+    };
+  },
+  getRegisteredRunAgentPrompt() {
+    return null;
+  },
+  getRegisteredRollbackWorkflow() {
+    return null;
+  },
+  getRegisteredStartWorkflow() {
+    return null;
+  },
+  removeSchedule() {},
+  registerRollbackWorkflow() {},
+  registerRunAgentPrompt() {},
+  registerStartWorkflow(startWorkflow) {
+    registerStartWorkflowArgs = startWorkflow;
+  },
+  setScheduleRuntimeSync() {},
+  upsertSchedule() {},
+}));
+
+const { boot } = await import('../src/index.ts?workflow-runtime-boot=' + ${JSON.stringify(crypto.randomUUID())});
+
+describe('workflow starter boot isolation', () => {
+  it('registers the shared workflow starter before exposing it to the API server', async () => {
+    const db = {
+      close() {},
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        return db;
+      },
+      migrate() {},
+      async cleanupOrphans() {},
+      createWarmPool() {
+        return {
+          async start() {},
+          async stop() {},
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      createWorkflowRuntime() {
+        return {
+          async start() {},
+          async stop() {},
+          startWorkflow: sharedStartWorkflow,
+          async rollbackWorkflow() {},
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {},
+        };
+      },
+      startApiServer(options) {
+        startApiServerArgs = options;
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {},
+        };
+      },
+    });
+
+    try {
+      expect(registerStartWorkflowArgs).toBe(sharedStartWorkflow);
+      expect(startApiServerArgs.startWorkflow).toBe(sharedStartWorkflow);
     } finally {
       await runtime.stop();
     }
@@ -1048,8 +1307,16 @@ mock.module('../src/jobs/cron-scheduler.ts', () => ({
   getRegisteredRunAgentPrompt() {
     return null;
   },
+  getRegisteredRollbackWorkflow() {
+    return null;
+  },
+  getRegisteredStartWorkflow() {
+    return null;
+  },
   removeSchedule() {},
+  registerRollbackWorkflow() {},
   registerRunAgentPrompt() {},
+  registerStartWorkflow() {},
   setScheduleRuntimeSync() {},
   upsertSchedule() {},
 }));

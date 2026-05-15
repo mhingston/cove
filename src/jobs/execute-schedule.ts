@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 
 import { getContainerRuntimeBin } from '../container/detect.ts';
 import { getImageName } from '../container/image.ts';
-import type { ScheduleRunAgentPrompt } from '../shared/types.ts';
+import type { ScheduleRollbackWorkflow, ScheduleRunAgentPrompt, ScheduleStartWorkflow } from '../shared/types.ts';
 import type { ScheduleRecord } from './schedules.ts';
 
 type AgentResult = {
@@ -34,10 +34,20 @@ type HybridResult = {
 
 type WorkflowResult = {
   mode: 'workflow';
-  config: Record<string, unknown> | null;
+  instanceId: string;
 };
 
 export type ScheduleExecutionResult = AgentResult | ScriptResult | NotificationResult | HybridResult | WorkflowResult;
+
+export type WorkflowScheduleExecutionResult = WorkflowResult & {
+  rollbackWorkflow?: ScheduleRollbackWorkflow;
+};
+
+export function hasWorkflowRollback(
+  result: ScheduleExecutionResult | WorkflowScheduleExecutionResult,
+): result is WorkflowScheduleExecutionResult {
+  return 'instanceId' in result;
+}
 
 function executeNotification(schedule: ScheduleRecord): NotificationResult {
   console.log(`[Schedule notification] ${schedule.id}: ${schedule.prompt}`);
@@ -67,18 +77,13 @@ function executeScript(schedule: ScheduleRecord): ScriptResult {
   };
 }
 
-function executeWorkflow(schedule: ScheduleRecord): WorkflowResult {
-  return {
-    mode: 'workflow',
-    config: schedule.config,
-  };
-}
-
 export async function executeSchedule(options: {
   schedule: ScheduleRecord;
   runAgentPrompt?: ScheduleRunAgentPrompt;
-}): Promise<ScheduleExecutionResult> {
-  const { schedule, runAgentPrompt } = options;
+  startWorkflow?: ScheduleStartWorkflow;
+  rollbackWorkflow?: ScheduleRollbackWorkflow;
+}): Promise<ScheduleExecutionResult | WorkflowScheduleExecutionResult> {
+  const { schedule, runAgentPrompt, startWorkflow, rollbackWorkflow } = options;
 
   switch (schedule.mode) {
     case 'agent':
@@ -103,6 +108,17 @@ export async function executeSchedule(options: {
       };
     }
     case 'workflow':
-      return executeWorkflow(schedule);
+      if (startWorkflow == null) {
+        throw new Error('startWorkflow is required for workflow schedules');
+      }
+
+      return {
+        mode: 'workflow',
+        rollbackWorkflow,
+        ...(await startWorkflow({
+          schedule,
+          input: schedule.config,
+        })),
+      };
   }
 }
