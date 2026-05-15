@@ -211,6 +211,17 @@ export function restartContainer(sessionId: string, reason?: string): boolean {
   return spawnContainer(entry.options);
 }
 
+export function stopAndForgetContainersForAgentGroup(agentGroupId: string): void {
+  const matchingSessionIds = [...activeContainers.entries()]
+    .filter(([, entry]) => entry.options.envVars?.COVE_AGENT_GROUP_ID === agentGroupId)
+    .map(([sessionId]) => sessionId);
+
+  for (const sessionId of matchingSessionIds) {
+    killContainer(sessionId, `agent group deleted: ${agentGroupId}`);
+    activeContainers.delete(sessionId);
+  }
+}
+
 export function getActiveContainers(): Map<string, ContainerEntry> {
   return activeContainers;
 }

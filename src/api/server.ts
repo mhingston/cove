@@ -8,6 +8,13 @@ import {
   handleGetApproval,
   handleListApprovals,
 } from './handlers/approvals.ts';
+import {
+  handleCreateAgentGroup,
+  handleDeleteAgentGroup,
+  handleGetAgentGroup,
+  handleListAgentGroups,
+  handleUpdateAgentGroup,
+} from './handlers/agent-groups.ts';
 import { handleChatCompletion } from './handlers/chat.ts';
 import { handleModels } from './handlers/models.ts';
 import {
@@ -58,6 +65,41 @@ const apiRoutes: ApiRoute[] = [
     pathname: /^\/v1\/models$/,
     handle(_request, context) {
       return handleModels(context);
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/agent-groups$/,
+    handle(request, context) {
+      return handleCreateAgentGroup(request, context.db);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/agent-groups$/,
+    handle(request, context) {
+      return handleListAgentGroups(request, context.db);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/agent-groups\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleGetAgentGroup(request, context.db, { id: match[1] });
+    },
+  },
+  {
+    method: 'PUT',
+    pathname: /^\/v1\/agent-groups\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleUpdateAgentGroup(request, context.db, { id: match[1] });
+    },
+  },
+  {
+    method: 'DELETE',
+    pathname: /^\/v1\/agent-groups\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleDeleteAgentGroup(request, context.db, { id: match[1] });
     },
   },
   {
