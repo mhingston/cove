@@ -1,5 +1,6 @@
 import type { Database } from 'bun:sqlite';
 import type { ScheduleRecord } from '../jobs/schedules.ts';
+import type { WorkflowService } from '../workflows/bridge.ts';
 
 export type AgentGroupSummaryRow = {
   id: string;
@@ -200,4 +201,5 @@ export type AppContext = {
   runAgentPrompt?: ScheduleRunAgentPrompt;
   startWorkflow?: ScheduleStartWorkflow;
   rollbackWorkflow?: ScheduleRollbackWorkflow;
+  workflowService?: WorkflowService;
 };

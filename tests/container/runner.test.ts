@@ -19,6 +19,15 @@ const gatewayEnvKeys = [
 const originalGatewayEnv = Object.fromEntries(
   gatewayEnvKeys.map((key) => [key, process.env[key]]),
 ) as Record<(typeof gatewayEnvKeys)[number], string | undefined>;
+const originalWorkflowApiBaseUrl = process.env.COVE_WORKFLOW_API_BASE_URL;
+const originalFetch = globalThis.fetch;
+
+type JsonTool = {
+  name: string;
+  execute(toolCallId: string, params: Record<string, unknown>): Promise<{
+    content: Array<{ type: 'text'; text: string }>;
+  }>;
+};
 
 function restoreEnvVar(key: string, value: string | undefined): void {
   if (value === undefined) {
@@ -154,6 +163,15 @@ function setupCentralDb(options: {
   return dbPath;
 }
 
+function parseToolJson(result: { content: Array<{ type: 'text'; text: string }> } | undefined): Record<string, unknown> {
+  const text = result?.content.map((part) => part.text).join('') ?? '';
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+function toRequest(input: Request | string | URL, init?: RequestInit): Request {
+  return input instanceof Request ? input : new Request(String(input), init);
+}
+
 function insertApproval(dbPath: string, row: {
   id: string;
   sessionId: string;
@@ -283,6 +301,8 @@ function createFakeDeps(options: {
 
 afterEach(() => {
   mock.restore();
+  globalThis.fetch = originalFetch;
+  restoreEnvVar('COVE_WORKFLOW_API_BASE_URL', originalWorkflowApiBaseUrl);
 
   for (const key of gatewayEnvKeys) {
     restoreEnvVar(key, originalGatewayEnv[key]);
@@ -468,7 +488,7 @@ describe('container runner phase 5', () => {
         return createFakeDeps({ responseText: 'No live tools required' }).createSession!(sessionOptions);
       },
       createCoveTools() {
-        throw new Error('COVE_CENTRAL_DB_PATH is required for live container tools');
+        return [];
       },
     };
 
@@ -488,6 +508,360 @@ describe('container runner phase 5', () => {
 
     expect(response).toBe('No live tools required');
     expect(captured.customToolsHistory).toEqual([undefined, undefined]);
+  });
+
+  it('registers workflow bridge tools and start-workflow forwards current agent and session context', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-tools-');
+    const sessionId = 'sess-workflow-tools-1';
+    const requests: Request[] = [];
+    let customTools: JsonTool[] | undefined;
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: 'group-workflow-tools',
+        COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+      },
+    });
+    writeUserMessage(sessionDir, 'Make workflow tools available.');
+
+    globalThis.fetch = mock(async (input: Request | string | URL, init?: RequestInit) => {
+      const request = toRequest(input, init);
+      requests.push(request);
+      return new Response(JSON.stringify({ instanceId: 'workflow-instance-1' }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      {
+        async createSession(sessionOptions) {
+          customTools = sessionOptions.customTools as JsonTool[] | undefined;
+          return createFakeDeps({ responseText: 'Workflow tools ready' }).createSession!(sessionOptions);
+        },
+      },
+    );
+
+    expect(customTools?.map((tool) => tool.name)).toEqual([
+      'start-workflow',
+      'get-workflow',
+      'list-workflows',
+      'signal-workflow',
+      'wait-for-workflow',
+    ]);
+
+    const result = await customTools?.find((tool) => tool.name === 'start-workflow')?.execute('call-1', {
+      name: 'daily-summary',
+      input: { topic: 'sales' },
+    });
+
+    expect(parseToolJson(result)).toEqual({
+      tool: 'start-workflow',
+      instanceId: 'workflow-instance-1',
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url).toBe('http://host.docker.internal:4111/v1/workflows');
+    expect(requests[0]?.method).toBe('POST');
+    expect(JSON.parse(await requests[0]!.text())).toEqual({
+      name: 'daily-summary',
+      input: { topic: 'sales' },
+      agent_group_id: 'group-workflow-tools',
+      session_id: sessionId,
+    });
+  });
+
+  it('fails clearly when workflow bridge tools run without COVE_WORKFLOW_API_BASE_URL', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-tools-missing-bridge-');
+    const sessionId = 'sess-workflow-tools-missing-bridge';
+    const stateDir = makeTempDir('cove-v2-runner-workflow-tools-missing-bridge-state-');
+    const agentGroupId = 'group-workflow-tools-missing-bridge';
+    const centralDbPath = setupCentralDb({ stateDir, sessionId, agentGroupId, sessionDir });
+    let customTools: JsonTool[] | undefined;
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: agentGroupId,
+        COVE_CENTRAL_DB_PATH: centralDbPath,
+      },
+    });
+    writeUserMessage(sessionDir, 'Try workflow tools without bridge config.');
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      {
+        async createSession(sessionOptions) {
+          customTools = sessionOptions.customTools as JsonTool[] | undefined;
+          return createFakeDeps({ responseText: 'Workflow tools unavailable' }).createSession!(sessionOptions);
+        },
+      },
+    );
+
+    const result = await customTools?.find((tool) => tool.name === 'list-workflows')?.execute('call-2', {});
+
+    expect(parseToolJson(result)).toEqual({
+      tool: 'list-workflows',
+      error: 'COVE_WORKFLOW_API_BASE_URL is required for workflow bridge tools',
+    });
+  });
+
+  it('polls the host workflow bridge until wait-for-workflow reaches a terminal state', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-wait-workflow-');
+    const sessionId = 'sess-wait-workflow-1';
+    let customTools: JsonTool[] | undefined;
+    const requests: Request[] = [];
+    const responses = [
+      {
+        instanceId: 'workflow-instance-1',
+        name: 'daily-summary',
+        status: 'Running',
+        output: null,
+        customStatus: 'step-1',
+        createdAt: '2026-01-15T08:00:00.000Z',
+        updatedAt: '2026-01-15T08:01:00.000Z',
+      },
+      {
+        instanceId: 'workflow-instance-1',
+        name: 'daily-summary',
+        status: 'Completed',
+        output: { ok: true },
+        customStatus: null,
+        createdAt: '2026-01-15T08:00:00.000Z',
+        updatedAt: '2026-01-15T08:02:00.000Z',
+      },
+    ];
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+      },
+    });
+    writeUserMessage(sessionDir, 'Wait for workflow completion.');
+
+    globalThis.fetch = mock(async (input: Request | string | URL, init?: RequestInit) => {
+      const request = toRequest(input, init);
+      requests.push(request);
+      return new Response(JSON.stringify(responses.shift() ?? responses.at(-1)), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      {
+        async createSession(sessionOptions) {
+          customTools = sessionOptions.customTools as JsonTool[] | undefined;
+          return createFakeDeps({ responseText: 'Workflow wait ready' }).createSession!(sessionOptions);
+        },
+      },
+    );
+
+    const result = await customTools?.find((tool) => tool.name === 'wait-for-workflow')?.execute('call-3', {
+      instanceId: 'workflow-instance-1',
+      timeoutMs: 50,
+      pollIntervalMs: 1,
+    });
+
+    expect(parseToolJson(result)).toEqual({
+      tool: 'wait-for-workflow',
+      instanceId: 'workflow-instance-1',
+      name: 'daily-summary',
+      status: 'Completed',
+      output: { ok: true },
+      customStatus: null,
+      createdAt: '2026-01-15T08:00:00.000Z',
+      updatedAt: '2026-01-15T08:02:00.000Z',
+    });
+    expect(requests.filter((request) => request.url.endsWith('/v1/workflows/workflow-instance-1'))).toHaveLength(2);
+  });
+
+  it('returns the latest known workflow state plus timed_out=true when wait-for-workflow times out', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-wait-workflow-timeout-');
+    const sessionId = 'sess-wait-workflow-timeout-1';
+    let customTools: JsonTool[] | undefined;
+    const requests: Request[] = [];
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+      },
+    });
+    writeUserMessage(sessionDir, 'Wait for workflow timeout.');
+
+    globalThis.fetch = mock(async (input: Request | string | URL, init?: RequestInit) => {
+      const request = toRequest(input, init);
+      requests.push(request);
+      return new Response(JSON.stringify({
+        instanceId: 'workflow-instance-timeout',
+        name: 'daily-summary',
+        status: 'Running',
+        output: null,
+        customStatus: 'step-1',
+        createdAt: '2026-01-15T08:00:00.000Z',
+        updatedAt: '2026-01-15T08:01:00.000Z',
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      {
+        async createSession(sessionOptions) {
+          customTools = sessionOptions.customTools as JsonTool[] | undefined;
+          return createFakeDeps({ responseText: 'Workflow wait timeout ready' }).createSession!(sessionOptions);
+        },
+      },
+    );
+
+    const result = await customTools?.find((tool) => tool.name === 'wait-for-workflow')?.execute('call-4', {
+      instanceId: 'workflow-instance-timeout',
+      timeoutMs: 10,
+      pollIntervalMs: 1,
+    });
+
+    expect(parseToolJson(result)).toEqual({
+      tool: 'wait-for-workflow',
+      instanceId: 'workflow-instance-timeout',
+      name: 'daily-summary',
+      status: 'Running',
+      output: null,
+      customStatus: 'step-1',
+      createdAt: '2026-01-15T08:00:00.000Z',
+      updatedAt: '2026-01-15T08:01:00.000Z',
+      timed_out: true,
+    });
+    expect(requests.length).toBeGreaterThan(1);
+  });
+
+  it('rebuilds workflow bridge tools from the latest persisted session_config on each prompt cycle', async () => {
+    const stateDir = makeTempDir('cove-v2-runner-workflow-tools-refresh-state-');
+    const sessionDir = path.join(stateDir, 'sessions', 'group-workflow-tools-refresh', 'sess-workflow-tools-refresh');
+    const sessionId = 'sess-workflow-tools-refresh';
+    const agentGroupId = 'group-workflow-tools-refresh';
+    const centralDbPath = setupCentralDb({ stateDir, sessionId, agentGroupId, sessionDir });
+    const toolRuntimeHistory: Array<Record<string, unknown> | undefined> = [];
+    let promptCount = 0;
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: agentGroupId,
+        COVE_CENTRAL_DB_PATH: centralDbPath,
+      },
+    });
+    writeUserMessage(sessionDir, 'First prompt cycle.');
+    writeUserMessage(sessionDir, 'Second prompt cycle.');
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      {
+        createCoveTools(_db, _embedTexts, runtime) {
+          toolRuntimeHistory.push(runtime as Record<string, unknown> | undefined);
+          return [{
+            name: 'dummy-tool',
+            description: 'dummy',
+            parameters: { type: 'object', properties: {} },
+            execute: async () => ({ content: [{ type: 'text', text: '{}' }], details: {} }),
+          }];
+        },
+        async createSession() {
+          return {
+            session: {
+              subscribe() {
+                return () => {};
+              },
+              async prompt() {
+                promptCount += 1;
+
+                if (promptCount === 1) {
+                  writeSessionConfig(sessionDir, {
+                    provider: 'anthropic',
+                    model: 'claude-runner',
+                    extra_env: {
+                      COVE_AGENT_GROUP_ID: agentGroupId,
+                      COVE_CENTRAL_DB_PATH: centralDbPath,
+                      COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+                    },
+                  });
+                }
+              },
+            },
+          };
+        },
+      },
+    );
+
+    expect(toolRuntimeHistory).toEqual([
+      {
+        agentGroupId,
+        centralDbPath,
+        sessionId,
+        workflowApiBaseUrl: undefined,
+      },
+      {
+        agentGroupId,
+        centralDbPath,
+        sessionId,
+        workflowApiBaseUrl: 'http://host.docker.internal:4111',
+      },
+    ]);
   });
 
   it('creates a pending approval and writes confirm metadata for blocked confirm-tier tool calls', async () => {
@@ -1094,6 +1468,8 @@ describe('container runner phase 5', () => {
     expect(captured.createCoveToolsArgs?.[1]).toEqual({
       agentGroupId,
       centralDbPath,
+      sessionId,
+      workflowApiBaseUrl: undefined,
     });
     expect(captured.customTools?.map((tool) => tool.name)).toEqual(['wiki_search']);
   });

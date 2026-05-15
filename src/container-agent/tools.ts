@@ -11,6 +11,7 @@ import {
   hybridSearchWikiEntries,
 } from '../knowledge/wiki.ts';
 import { hybridSearch } from '../knowledge/search.ts';
+import { createWorkflowBridge } from './workflow-bridge.ts';
 
 export type ToolResultPart = {
   type: 'text';
@@ -39,6 +40,8 @@ export type ToolDefinition = {
 export type CoveToolRuntimeOptions = {
   agentGroupId?: string;
   centralDbPath?: string;
+  sessionId?: string;
+  workflowApiBaseUrl?: string;
 };
 
 function jsonToolResult(payload: Record<string, unknown>): ToolResult {
@@ -46,6 +49,13 @@ function jsonToolResult(payload: Record<string, unknown>): ToolResult {
     content: [{ type: 'text', text: JSON.stringify(payload) }],
     details: {},
   };
+}
+
+function workflowToolErrorResult(name: string, error: unknown): ToolResult {
+  return jsonToolResult({
+    tool: name,
+    error: error instanceof Error ? error.message : String(error),
+  });
 }
 
 function resolveAgentGroupId(value: unknown, fallback?: string): string | undefined {
@@ -257,10 +267,186 @@ function createSaveWikiTool(db: Database, name: string, label: string): ToolDefi
   };
 }
 
+function createStartWorkflowTool(name: string, label: string, runtime?: CoveToolRuntimeOptions): ToolDefinition {
+  return {
+    name,
+    label,
+    description: 'Start a host-owned workflow through the workflow bridge API.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Workflow definition name' },
+        input: { type: 'object', description: 'Workflow input payload' },
+        id: { type: 'string', description: 'Optional caller-supplied workflow instance id' },
+      },
+      required: ['name', 'input'],
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const workflowName = typeof params.name === 'string' ? params.name : '';
+        const input = typeof params.input === 'object' && params.input != null && !Array.isArray(params.input)
+          ? params.input as Record<string, unknown>
+          : {};
+        const bridge = createWorkflowBridge({
+          runtime: {
+            workflowApiBaseUrl: runtime?.workflowApiBaseUrl,
+            agentGroupId: runtime?.agentGroupId,
+            sessionId: runtime?.sessionId,
+          },
+        });
+        const started = await bridge.startWorkflow({
+          ...(typeof params.id === 'string' ? { id: params.id } : {}),
+          name: workflowName,
+          input,
+        });
+        return jsonToolResult({ tool: name, instanceId: started.instanceId });
+      } catch (error) {
+        return workflowToolErrorResult(name, error);
+      }
+    },
+  };
+}
+
+function createGetWorkflowTool(name: string, label: string, runtime?: CoveToolRuntimeOptions): ToolDefinition {
+  return {
+    name,
+    label,
+    description: 'Fetch a workflow instance from the host workflow bridge API.',
+    parameters: {
+      type: 'object',
+      properties: {
+        instanceId: { type: 'string', description: 'Workflow instance id' },
+      },
+      required: ['instanceId'],
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const instanceId = typeof params.instanceId === 'string' ? params.instanceId : '';
+        const bridge = createWorkflowBridge({
+          runtime: { workflowApiBaseUrl: runtime?.workflowApiBaseUrl },
+        });
+        return jsonToolResult({ tool: name, ...(await bridge.getWorkflow(instanceId)) });
+      } catch (error) {
+        return workflowToolErrorResult(name, error);
+      }
+    },
+  };
+}
+
+function createListWorkflowsTool(name: string, label: string, runtime?: CoveToolRuntimeOptions): ToolDefinition {
+  return {
+    name,
+    label,
+    description: 'List workflow definitions and instances through the host workflow bridge API.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Optional workflow name filter' },
+        status: { type: 'string', description: 'Optional workflow status filter' },
+      },
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const bridge = createWorkflowBridge({
+          runtime: { workflowApiBaseUrl: runtime?.workflowApiBaseUrl },
+        });
+        const response = await bridge.listWorkflows({
+          ...(typeof params.name === 'string' ? { name: params.name } : {}),
+          ...(typeof params.status === 'string' ? { status: params.status as 'Pending' | 'Running' | 'Completed' | 'Failed' | 'Terminated' } : {}),
+        });
+        return jsonToolResult({ tool: name, ...response });
+      } catch (error) {
+        return workflowToolErrorResult(name, error);
+      }
+    },
+  };
+}
+
+function createSignalWorkflowTool(name: string, label: string, runtime?: CoveToolRuntimeOptions): ToolDefinition {
+  return {
+    name,
+    label,
+    description: 'Signal a running workflow instance through the host workflow bridge API.',
+    parameters: {
+      type: 'object',
+      properties: {
+        instanceId: { type: 'string', description: 'Workflow instance id' },
+        eventName: { type: 'string', description: 'Signal event name' },
+        data: { type: 'object', description: 'Signal payload' },
+      },
+      required: ['instanceId', 'eventName', 'data'],
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const bridge = createWorkflowBridge({
+          runtime: { workflowApiBaseUrl: runtime?.workflowApiBaseUrl },
+        });
+        const response = await bridge.signalWorkflow({
+          instanceId: typeof params.instanceId === 'string' ? params.instanceId : '',
+          eventName: typeof params.eventName === 'string' ? params.eventName : '',
+          data: typeof params.data === 'object' && params.data != null && !Array.isArray(params.data)
+            ? params.data as Record<string, unknown>
+            : {},
+        });
+        return jsonToolResult({ tool: name, ...response });
+      } catch (error) {
+        return workflowToolErrorResult(name, error);
+      }
+    },
+  };
+}
+
+function createWaitForWorkflowTool(name: string, label: string, runtime?: CoveToolRuntimeOptions): ToolDefinition {
+  return {
+    name,
+    label,
+    description: 'Poll the host workflow bridge API until a workflow instance finishes or times out.',
+    parameters: {
+      type: 'object',
+      properties: {
+        instanceId: { type: 'string', description: 'Workflow instance id' },
+        timeoutMs: { type: 'number', description: 'Optional wait timeout in milliseconds' },
+        pollIntervalMs: { type: 'number', description: 'Optional polling interval in milliseconds' },
+      },
+      required: ['instanceId'],
+    },
+    async execute(_toolCallId, params) {
+      try {
+        const bridge = createWorkflowBridge({
+          runtime: { workflowApiBaseUrl: runtime?.workflowApiBaseUrl },
+        });
+        const result = await bridge.waitForWorkflow({
+          instanceId: typeof params.instanceId === 'string' ? params.instanceId : '',
+          ...(typeof params.timeoutMs === 'number' ? { timeoutMs: params.timeoutMs } : {}),
+          ...(typeof params.pollIntervalMs === 'number' ? { pollIntervalMs: params.pollIntervalMs } : {}),
+        });
+        return jsonToolResult({ tool: name, ...result });
+      } catch (error) {
+        return workflowToolErrorResult(name, error);
+      }
+    },
+  };
+}
+
 export function createCoveTools(db?: Database, embedTexts?: EmbedTexts, runtime?: CoveToolRuntimeOptions): ToolDefinition[] {
+  const tools = [
+    createStartWorkflowTool('start-workflow', 'Start Workflow', runtime),
+    createGetWorkflowTool('get-workflow', 'Get Workflow', runtime),
+    createListWorkflowsTool('list-workflows', 'List Workflows', runtime),
+    createSignalWorkflowTool('signal-workflow', 'Signal Workflow', runtime),
+    createWaitForWorkflowTool('wait-for-workflow', 'Wait For Workflow', runtime),
+  ];
+
+  const hasKnowledgeDb = db != null || resolveCentralDbPath(runtime) != null;
+
+  if (!hasKnowledgeDb) {
+    return tools;
+  }
+
   const toolDb = db ?? openCentralDb(runtime);
 
   return [
+    ...tools,
     createSearchMemoriesTool(toolDb, 'memory_search', 'Memory Search', embedTexts, runtime),
     createSaveMemoryTool(toolDb, 'memory_store', 'Memory Store', embedTexts, runtime),
     createReadWikiTool(toolDb, 'wiki_get', 'Wiki Get'),

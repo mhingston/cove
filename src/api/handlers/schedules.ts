@@ -218,9 +218,10 @@ export async function handleRunSchedule(
   const runAgentPrompt = context.runAgentPrompt ?? getRegisteredRunAgentPrompt() ?? undefined;
   const startWorkflow = context.startWorkflow ?? getRegisteredStartWorkflow() ?? undefined;
   const rollbackWorkflow = context.rollbackWorkflow ?? getRegisteredRollbackWorkflow() ?? undefined;
+  const workflowService = context.workflowService;
 
   try {
-    const result = await executeSchedule({ schedule, runAgentPrompt, startWorkflow, rollbackWorkflow });
+    const result = await executeSchedule({ schedule, runAgentPrompt, startWorkflow, rollbackWorkflow, workflowService });
     const ranAt = 'lastRunAt' in result ? result.lastRunAt : new Date().toISOString();
 
     try {

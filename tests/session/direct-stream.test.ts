@@ -279,7 +279,10 @@ describe('streamDirectSessionTokens', () => {
           config: {
             provider: 'anthropic',
             model: 'claude-request',
-            extra_env: { EXTRA_FLAG: 'kept' },
+            extra_env: {
+              EXTRA_FLAG: 'kept',
+              COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+            },
           },
           messages: [{ role: 'user', content: 'Hello stream' }],
         },
@@ -297,6 +300,7 @@ describe('streamDirectSessionTokens', () => {
         EXTRA_FLAG: 'kept',
         COVE_PERSONA: 'db persona',
         COVE_AGENT_GROUP_ID: 'stream-group',
+        COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
       });
     } finally {
       db.close();
@@ -337,6 +341,7 @@ describe('streamDirectSessionTokens', () => {
             extra_env: {
               EXTRA_FLAG: 'kept',
               COVE_PERSONA: 'explicit persona',
+              COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
             },
           },
           messages: [{ role: 'user', content: 'Hello stream' }],
@@ -355,6 +360,7 @@ describe('streamDirectSessionTokens', () => {
         EXTRA_FLAG: 'kept',
         COVE_PERSONA: 'explicit persona',
         COVE_AGENT_GROUP_ID: 'stream-group',
+        COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
       });
     } finally {
       db.close();
@@ -439,6 +445,48 @@ describe('streamDirectSessionTokens', () => {
       }
 
       expect(tokens).toEqual(['SDK:anthropic/claude-request:continueRecent:Use default runner']);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('preserves workflow bridge base URL in persisted session_config before running the direct runner', async () => {
+    const stateDir = makeStateDir();
+    const db = new Database(':memory:');
+    migrate(db);
+
+    const routing = makeRoutingResult(stateDir, { sessionId: 'sess-stream-workflow-bridge' });
+
+    try {
+      for await (const _token of streamDirectSessionTokens(
+        {
+          centralDb: db,
+          routing,
+          config: {
+            provider: 'anthropic',
+            model: 'claude-request',
+            extra_env: {
+              EXTRA_FLAG: 'kept',
+              COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+            },
+          },
+          messages: [{ role: 'user', content: 'Hello stream' }],
+        },
+        {
+          runContainerSession: async (_options, _onResponse, _deps, onToken) => {
+            onToken?.('ok');
+            return 'ok';
+          },
+        },
+      )) {
+        // consume stream
+      }
+
+      expect(readPersistedExtraEnv(routing.session.session_file!)).toEqual({
+        EXTRA_FLAG: 'kept',
+        COVE_AGENT_GROUP_ID: 'stream-group',
+        COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+      });
     } finally {
       db.close();
     }

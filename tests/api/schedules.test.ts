@@ -4,6 +4,7 @@ import { Database } from 'bun:sqlite';
 import { createApp } from '../../src/api/app.ts';
 import { migrate } from '../../src/db/migrate.ts';
 import { registerRunAgentPrompt, setScheduleRuntimeSync } from '../../src/jobs/cron-scheduler.ts';
+import { createWorkflowService } from '../../src/workflows/bridge.ts';
 
 type RunAgentPromptFn = (options: {
   schedule: {
@@ -507,6 +508,143 @@ describe('schedules api', () => {
           instance_id: 'workflow-instance-1',
           config: workflowConfig,
         },
+      });
+
+      const persistedResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}`));
+      expect(persistedResponse.status).toBe(200);
+      expect(await json<Record<string, unknown>>(persistedResponse)).toMatchObject({
+        id: created.id,
+        last_run_at: expect.any(String),
+        next_run_at: expect.any(String),
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('prefers workflowService.startScheduledWorkflow over the legacy startWorkflow seam for immediate workflow runs', async () => {
+    const db = createScheduleDb();
+
+    try {
+      const workflowConfig = {
+        name: 'daily-summary',
+        workflow: 'fallback-name',
+        notify: true,
+      };
+      const legacyStartWorkflow = mock(async () => ({
+        instanceId: 'legacy-workflow-instance',
+      }));
+      const backendStartWorkflow = mock(async (input: { name: string; input?: { input: Record<string, unknown> | null } }) => {
+        expect(input.name).toBe('daily-summary');
+        expect(input.input?.input).toEqual(workflowConfig);
+
+        return {
+          instanceId: 'workflow-instance-2',
+        };
+      });
+      const workflowService = createWorkflowService({
+        async listDefinitions() {
+          return [];
+        },
+        async listInstances() {
+          return [];
+        },
+        startWorkflow: backendStartWorkflow,
+        async getWorkflow() {
+          return null;
+        },
+        async signalWorkflow() {},
+        async terminateWorkflow() {},
+        async waitForWorkflow() {
+          throw new Error('not used');
+        },
+        async rollbackWorkflow() {},
+      });
+      const app = createApp({ db, startWorkflow: legacyStartWorkflow, workflowService });
+
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'Workflow run',
+          mode: 'workflow',
+          config: workflowConfig,
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+
+      const runResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}/run`, {
+        method: 'POST',
+      }));
+
+      expect(runResponse.status).toBe(200);
+      expect(backendStartWorkflow).toHaveBeenCalledTimes(1);
+      expect(legacyStartWorkflow).not.toHaveBeenCalled();
+      expect(await json<Record<string, unknown>>(runResponse)).toEqual({
+        status: 'completed',
+        schedule_id: created.id,
+        last_run_at: expect.any(String),
+        result: {
+          mode: 'workflow',
+          instance_id: 'workflow-instance-2',
+          config: workflowConfig,
+        },
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('returns a client-safe 500 when the shared workflowService path rejects a workflow schedule with no name', async () => {
+    const db = createScheduleDb();
+
+    try {
+      const workflowService = createWorkflowService({
+        async listDefinitions() {
+          return [];
+        },
+        async listInstances() {
+          return [];
+        },
+        async startWorkflow() {
+          return {
+            instanceId: 'workflow-instance-3',
+          };
+        },
+        async getWorkflow() {
+          return null;
+        },
+        async signalWorkflow() {},
+        async terminateWorkflow() {},
+        async waitForWorkflow() {
+          throw new Error('not used');
+        },
+        async rollbackWorkflow() {},
+      });
+      const app = createApp({ db, workflowService });
+
+      const createResponse = await app.fetch(new Request('http://cove.test/v1/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agent_group_id: 'support',
+          cron_expr: '0 9 * * *',
+          prompt: 'Workflow run',
+          mode: 'workflow',
+          config: { notify: true },
+        }),
+      }));
+      const created = await json<Record<string, unknown>>(createResponse);
+
+      const runResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}/run`, {
+        method: 'POST',
+      }));
+
+      expect(runResponse.status).toBe(500);
+      expect(await json<Record<string, unknown>>(runResponse)).toEqual({
+        error: 'Failed to run schedule',
       });
 
       const persistedResponse = await app.fetch(new Request(`http://cove.test/v1/schedules/${created.id as string}`));

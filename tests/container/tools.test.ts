@@ -30,10 +30,15 @@ afterEach(() => {
 });
 
 describe('createCoveTools shape', () => {
-  it('returns the 10 planned memory and wiki tools in order', () => {
+  it('returns workflow bridge, memory, and wiki tools in order', () => {
     const tools = createCoveTools(db);
 
     expect(tools.map((tool) => tool.name)).toEqual([
+      'start-workflow',
+      'get-workflow',
+      'list-workflows',
+      'signal-workflow',
+      'wait-for-workflow',
       'memory_search',
       'memory_store',
       'wiki_get',
@@ -52,6 +57,6 @@ describe('createCoveTools shape', () => {
 
     const tools = createCoveTools();
 
-    expect(tools).toHaveLength(10);
+    expect(tools).toHaveLength(15);
   });
 });

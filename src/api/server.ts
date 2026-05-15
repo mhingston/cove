@@ -19,6 +19,13 @@ import {
   handleUpdateSchedule,
 } from './handlers/schedules.ts';
 import {
+  handleCreateWorkflow,
+  handleGetWorkflow,
+  handleListWorkflows,
+  handleSignalWorkflow,
+  handleTerminateWorkflow,
+} from './handlers/workflows.ts';
+import {
   handleCreateWiki,
   handleDeleteWiki,
   handleGetWiki,
@@ -114,6 +121,41 @@ const apiRoutes: ApiRoute[] = [
     pathname: /^\/v1\/schedules\/([^/]+)\/run$/,
     handle(request, context, match) {
       return handleRunSchedule(request, context, { id: match[1] });
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/workflows$/,
+    handle(request, context) {
+      return handleListWorkflows(request, context);
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/workflows$/,
+    handle(request, context) {
+      return handleCreateWorkflow(request, context);
+    },
+  },
+  {
+    method: 'GET',
+    pathname: /^\/v1\/workflows\/([^/]+)$/,
+    handle(request, context, match) {
+      return handleGetWorkflow(request, context, { instanceId: match[1] });
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/workflows\/([^/]+)\/signal$/,
+    handle(request, context, match) {
+      return handleSignalWorkflow(request, context, { instanceId: match[1] });
+    },
+  },
+  {
+    method: 'POST',
+    pathname: /^\/v1\/workflows\/([^/]+)\/terminate$/,
+    handle(request, context, match) {
+      return handleTerminateWorkflow(request, context, { instanceId: match[1] });
     },
   },
   {
@@ -260,6 +302,7 @@ export function startApiServer(options: {
   chat?: ChatHandlerContext;
   startWorkflow?: ScheduleStartWorkflow;
   rollbackWorkflow?: ScheduleRollbackWorkflow;
+  workflowService?: AppContext['workflowService'];
 }): ApiServer {
   const requestedPort = options.port ?? resolvePort();
   const hostname = '127.0.0.1';
@@ -268,6 +311,7 @@ export function startApiServer(options: {
     chat: options.chat,
     startWorkflow: options.startWorkflow,
     rollbackWorkflow: options.rollbackWorkflow,
+    workflowService: options.workflowService,
   };
 
   const server = Bun.serve({

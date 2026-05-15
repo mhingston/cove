@@ -1,7 +1,10 @@
 import { Database } from 'bun:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { validateToolArguments, type AssistantMessage, type TextContent, type ToolCall as AiToolCall } from '@mariozechner/pi-ai';
+import { type Agent, type AgentMessage, type AgentTool, type AgentToolResult } from '@mariozechner/pi-agent-core';
 
 import { PermissionBridgeImpl } from '../control/permissions.ts';
 import { PolicyEngine } from '../control/policy.ts';
@@ -84,7 +87,24 @@ type RunnerSession = {
 };
 
 type RunnerSessionResult = {
-  session: RunnerSession;
+  session: RunnerSession & {
+    agent?: Agent;
+    model?: unknown;
+    resourceLoader?: RunnerResourceLoader;
+    getToolDefinition?(name: string): ToolDefinition | undefined;
+    getLastAssistantText?(): string | undefined;
+    messages?: AgentMessage[];
+    waitForIdle?(): Promise<void>;
+  };
+};
+
+export type PreparedHostSession = {
+  session: RunnerSessionResult['session'];
+  config: SessionConfig;
+  sessionId: string;
+  sessionStateDir: string;
+  resourceLoader: RunnerResourceLoader;
+  customTools?: ToolDefinition[];
 };
 
 type CodingAgentSdkModule = {
@@ -132,7 +152,12 @@ type RunnerGatewayAuthState = {
 
 export type ContainerSessionDeps = {
   createSession?(options: CreateSessionOptions): Promise<RunnerSessionResult>;
-  createCoveTools?(db?: Database, embedTexts?: EmbedTexts, runtime?: { agentGroupId?: string; centralDbPath?: string }): ToolDefinition[];
+  createCoveTools?(db?: Database, embedTexts?: EmbedTexts, runtime?: {
+    agentGroupId?: string;
+    centralDbPath?: string;
+    sessionId?: string;
+    workflowApiBaseUrl?: string;
+  }): ToolDefinition[];
   resolveInstalledPackageDir?(packageName: string): string | undefined;
 };
 
@@ -270,6 +295,10 @@ function getAgentGroupId(config: SessionConfig): string | undefined {
   return config.extra_env?.COVE_AGENT_GROUP_ID ?? process.env.COVE_AGENT_GROUP_ID;
 }
 
+function getWorkflowApiBaseUrl(config: SessionConfig): string | undefined {
+  return config.extra_env?.COVE_WORKFLOW_API_BASE_URL ?? process.env.COVE_WORKFLOW_API_BASE_URL;
+}
+
 function toText(value: unknown): string {
   if (typeof value === 'string') {
     return value;
@@ -389,13 +418,16 @@ function prepareMcpAgentDir(config: SessionConfig, sessionStateDir: string, reso
 function resolveCustomTools(
   createCustomTools: Required<ContainerSessionDeps>['createCoveTools'],
   config: SessionConfig,
+  sessionId: string,
 ): ToolDefinition[] | undefined {
   const runtime = {
     agentGroupId: getAgentGroupId(config),
     centralDbPath: getCentralDbPath(config),
+    sessionId,
+    workflowApiBaseUrl: getWorkflowApiBaseUrl(config),
   };
 
-  if (!runtime.centralDbPath) {
+  if (!runtime.centralDbPath && !runtime.workflowApiBaseUrl && !runtime.agentGroupId) {
     return undefined;
   }
 
@@ -469,6 +501,282 @@ function blockedToolResultText(result: BlockedToolResult | undefined): string | 
   }
 
   return result.permission === 'confirm' ? result.message : result.question;
+}
+
+function createAssistantToolCall(toolName: string, args: Record<string, unknown>): AssistantMessage {
+  return {
+    role: 'assistant',
+    content: [{
+      type: 'toolCall',
+      id: crypto.randomUUID(),
+      name: toolName,
+      arguments: args,
+    }],
+    api: 'anthropic-messages',
+    provider: 'anthropic',
+    model: 'workflow-host',
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 0,
+      },
+    },
+    stopReason: 'toolUse',
+    timestamp: Date.now(),
+  };
+}
+
+function createTextContent(text: string): TextContent {
+  return {
+    type: 'text',
+    text,
+  };
+}
+
+function createErrorToolResult(message: string): AgentToolResult<unknown> {
+  return {
+    content: [createTextContent(message)],
+    details: {},
+  };
+}
+
+function resolveRunnerPersona(config: SessionConfig): string | undefined {
+  if (config.extra_env?.COVE_PERSONA?.trim()) {
+    return config.extra_env.COVE_PERSONA;
+  }
+
+  const agentGroupId = getAgentGroupId(config);
+  const centralDbPath = getCentralDbPath(config);
+
+  if (agentGroupId == null || centralDbPath == null) {
+    return undefined;
+  }
+
+  return loadPersona(agentGroupId, {
+    personaText: config.extra_env?.COVE_PERSONA,
+    dbPath: centralDbPath,
+    allowFilesystemFallback: false,
+  }) ?? undefined;
+}
+
+function isMaterializedResourceLoader(value: unknown): value is {
+  getExtensions(): unknown;
+  reload(): Promise<void>;
+} {
+  return value != null
+    && typeof value === 'object'
+    && typeof (value as { getExtensions?: unknown }).getExtensions === 'function'
+    && typeof (value as { reload?: unknown }).reload === 'function';
+}
+
+async function materializeResourceLoader(options: RunnerResourceLoader): Promise<RunnerResourceLoader> {
+  const packageDir = resolveInstalledPackageDir('@mariozechner/pi-coding-agent');
+
+  if (packageDir == null) {
+    throw new Error('Could not locate @mariozechner/pi-coding-agent installation');
+  }
+
+  const configModule = await import(pathToFileURL(path.join(packageDir, 'dist', 'config.js')).href) as {
+    getAgentDir(): string;
+  };
+  const module = await import(pathToFileURL(path.join(packageDir, 'dist', 'core', 'resource-loader.js')).href) as unknown as {
+    DefaultResourceLoader: new (loaderOptions: RunnerResourceLoader) => RunnerResourceLoader & {
+      reload(): Promise<void>;
+    };
+  };
+  const loader = new module.DefaultResourceLoader({
+    ...options,
+    agentDir: options.agentDir ?? configModule.getAgentDir(),
+  });
+  await loader.reload();
+  return loader;
+}
+
+function requireAgentSession(session: RunnerSessionResult['session']): RunnerSessionResult['session'] & {
+  agent: Agent;
+  getToolDefinition(name: string): ToolDefinition | undefined;
+} {
+  if (session.agent == null || typeof session.getToolDefinition !== 'function') {
+    throw new Error('Host session does not expose direct tool execution hooks');
+  }
+
+  return session as RunnerSessionResult['session'] & {
+    agent: Agent;
+    getToolDefinition(name: string): ToolDefinition | undefined;
+  };
+}
+
+export async function prepareHostSession(options: {
+  config: SessionConfig;
+  sessionId: string;
+  sessionStateDir: string;
+  deps?: ContainerSessionDeps;
+  approvalResume?: ApprovalResumeMetadata;
+  noSkills?: boolean;
+}): Promise<PreparedHostSession> {
+  const deps = options.deps ?? defaultDeps;
+  const createSession = deps.createSession ?? defaultDeps.createSession;
+  const createCustomTools = deps.createCoveTools ?? defaultDeps.createCoveTools;
+  const resolvePackageDir = deps.resolveInstalledPackageDir ?? defaultDeps.resolveInstalledPackageDir;
+  let blockedToolResult: BlockedToolResult | undefined;
+  const resourceLoader = buildResourceLoader({
+    config: options.config,
+    sessionId: options.sessionId,
+    sessionStateDir: options.sessionStateDir,
+    approvalResume: options.approvalResume,
+    onBlocked(result) {
+      blockedToolResult = result;
+    },
+    resolveInstalledPackageDir: resolvePackageDir,
+  });
+
+  if (options.noSkills !== undefined) {
+    resourceLoader.noSkills = options.noSkills;
+  }
+
+  const customTools = resolveCustomTools(createCustomTools, options.config, options.sessionId);
+  const sessionResult = await createSession({
+    config: options.config,
+    sessionId: options.sessionId,
+    sessionStateDir: options.sessionStateDir,
+    resourceLoader,
+    customTools,
+  });
+
+  if (blockedToolResult != null) {
+    throw new Error(blockedToolResultText(blockedToolResult) ?? 'Tool execution was blocked');
+  }
+
+  return {
+    session: sessionResult.session,
+    config: options.config,
+    sessionId: options.sessionId,
+    sessionStateDir: options.sessionStateDir,
+    resourceLoader,
+    customTools,
+  };
+}
+
+export async function executeHostToolCall(prepared: PreparedHostSession, toolName: string, args: Record<string, unknown>): Promise<AgentToolResult<unknown>> {
+  const session = requireAgentSession(prepared.session);
+  const agent = session.agent;
+  const assistantMessage = createAssistantToolCall(toolName, args);
+  const toolDefinition = session.getToolDefinition(toolName);
+  const toolCall = assistantMessage.content[0] as AiToolCall;
+
+  if (toolDefinition == null) {
+    throw new Error(`Tool ${toolName} not found`);
+  }
+
+  const tool = agent.state.tools.find((candidate) => candidate.name === toolName);
+  if (tool == null) {
+    throw new Error(`Tool ${toolName} is not active`);
+  }
+
+  const validatedArgs = validateToolArguments(toolDefinition, toolCall);
+  const context = {
+    systemPrompt: agent.state.systemPrompt,
+    messages: [...agent.state.messages.slice(), assistantMessage],
+    tools: agent.state.tools.slice(),
+  };
+
+  const beforeResult = await agent.beforeToolCall?.({
+    assistantMessage,
+    toolCall,
+    args: validatedArgs,
+    context,
+  });
+  if (beforeResult?.block) {
+    return createErrorToolResult(beforeResult.reason ?? 'Tool execution was blocked');
+  }
+
+  let result: AgentToolResult<unknown>;
+  let isError = false;
+
+  try {
+    result = await (tool as AgentTool).execute(toolCall.id, validatedArgs, undefined, undefined);
+  } catch (error) {
+    result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+    isError = true;
+  }
+
+  const afterResult = await agent.afterToolCall?.({
+    assistantMessage,
+    toolCall,
+    args: validatedArgs,
+    result,
+    isError,
+    context,
+  });
+  if (afterResult == null) {
+    return result;
+  }
+
+  return {
+    content: afterResult.content ?? result.content,
+    details: afterResult.details ?? result.details,
+    terminate: afterResult.terminate ?? result.terminate,
+  };
+}
+
+export async function executeHostLlmPrompt(prepared: PreparedHostSession, messages: AgentMessage[]): Promise<AssistantMessage> {
+  const session = requireAgentSession(prepared.session);
+  const agent = session.agent;
+  const persona = resolveRunnerPersona(prepared.config);
+  const baselineMessages = 'messages' in session && Array.isArray(session.messages)
+    ? session.messages.length
+    : agent.state.messages.length;
+  const previousSystemPrompt = agent.state.systemPrompt;
+
+  if (persona != null) {
+    agent.state.systemPrompt = `${previousSystemPrompt}\n\n${persona}`.trim();
+  }
+
+  try {
+    await agent.prompt(messages);
+    await agent.waitForIdle();
+  } finally {
+    agent.state.systemPrompt = previousSystemPrompt;
+  }
+
+  const messageLog = 'messages' in session && Array.isArray(session.messages)
+    ? session.messages
+    : agent.state.messages;
+  const assistant = messageLog
+    .slice(baselineMessages)
+    .findLast((message): message is AssistantMessage => message.role === 'assistant')
+    ?? messageLog.findLast((message): message is AssistantMessage => message.role === 'assistant');
+  if (assistant == null) {
+    throw new Error('Host LLM prompt did not produce an assistant response');
+  }
+
+  return assistant;
+}
+
+export async function executeHostSessionPrompt(prepared: PreparedHostSession, prompt: string): Promise<string> {
+  await prepared.session.prompt(prompt);
+
+  if (typeof prepared.session.waitForIdle === 'function') {
+    await prepared.session.waitForIdle();
+  }
+
+  if (typeof prepared.session.getLastAssistantText === 'function') {
+    const text = prepared.session.getLastAssistantText();
+
+    if (typeof text === 'string') {
+      return text;
+    }
+  }
+
+  throw new Error('Host session prompt did not produce assistant text');
 }
 
 function parseApprovalResumeMetadata(metadata: unknown): ApprovalResumeMetadata | undefined {
@@ -632,12 +940,16 @@ async function createDefaultSession(options: CreateSessionOptions): Promise<Runn
         throw new Error('No model resolved for container agent session.');
       }
 
+      const resourceLoader = options.resourceLoader == null || isMaterializedResourceLoader(options.resourceLoader)
+        ? options.resourceLoader
+        : await materializeResourceLoader(options.resourceLoader);
+
       return sdk.createAgentSession({
         authStorage: input.auth,
         modelRegistry,
         model: input.model,
         sessionManager: input.sessionManager,
-        resourceLoader: options.resourceLoader,
+        resourceLoader,
         customTools: options.customTools,
         thinkingLevel: options.config.thinking_level,
         cwd: options.config.workspace ?? process.cwd(),
@@ -859,14 +1171,16 @@ export async function runContainerSession(
     const createSession = deps.createSession ?? defaultDeps.createSession;
     const createCustomTools = deps.createCoveTools ?? defaultDeps.createCoveTools;
     const resolvePackageDir = deps.resolveInstalledPackageDir ?? defaultDeps.resolveInstalledPackageDir;
-    const customTools = resolveCustomTools(createCustomTools, effectiveConfig);
     let lastResponse = '';
 
     for (const message of messages) {
+      const persistedConfigForMessage = readSessionConfig(inboundDb);
+      const effectiveConfigForMessage = mergeSessionConfig(options.config, persistedConfigForMessage);
+      const customTools = resolveCustomTools(createCustomTools, effectiveConfigForMessage, sessionId);
       const approvalResume = parseApprovalResumeMetadata(message.metadata);
       let blockedToolResult: BlockedToolResult | undefined;
       const resourceLoader = buildResourceLoader({
-        config: effectiveConfig,
+        config: effectiveConfigForMessage,
         sessionId,
         sessionStateDir,
         approvalResume,
@@ -878,7 +1192,7 @@ export async function runContainerSession(
 
       const currentSession = (
         await createSession({
-          config: effectiveConfig,
+          config: effectiveConfigForMessage,
           sessionId,
           sessionStateDir,
           resourceLoader,

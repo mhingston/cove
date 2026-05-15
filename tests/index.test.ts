@@ -9,6 +9,7 @@ import type { ChatHandlerContext } from '../src/shared/types.ts';
 const originalPoolMin = process.env.COVE_POOL_MIN;
 const originalPoolMax = process.env.COVE_POOL_MAX;
 const originalSweepInterval = process.env.COVE_SWEEP_INTERVAL;
+const originalWorkflowApiBaseUrl = process.env.COVE_WORKFLOW_API_BASE_URL;
 
 afterEach(() => {
   if (originalPoolMin === undefined) {
@@ -27,6 +28,12 @@ afterEach(() => {
     delete process.env.COVE_SWEEP_INTERVAL;
   } else {
     process.env.COVE_SWEEP_INTERVAL = originalSweepInterval;
+  }
+
+  if (originalWorkflowApiBaseUrl === undefined) {
+    delete process.env.COVE_WORKFLOW_API_BASE_URL;
+  } else {
+    process.env.COVE_WORKFLOW_API_BASE_URL = originalWorkflowApiBaseUrl;
   }
 
   delete process.env.COVE_STATE_DIR;
@@ -118,6 +125,19 @@ async function bootWithDefaultWarmPool(options: {
 describe('boot sequence', () => {
   it('starts one host-owned workflow runtime against the state-dir database and stops it on shutdown', async () => {
     const steps: string[] = [];
+    const workflowService = {
+      listDefinitions: async () => [],
+      listInstances: async () => [],
+      startWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+      getWorkflow: async () => null,
+      signalWorkflow: async () => {},
+      terminateWorkflow: async () => {},
+      waitForWorkflow: async () => {
+        throw new Error('not implemented');
+      },
+      startScheduledWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+      rollbackWorkflow: async () => {},
+    };
     const db = {
       close() {
         steps.push('db.close');
@@ -159,12 +179,17 @@ describe('boot sequence', () => {
       createWorkflowRuntime(databasePath) {
         steps.push(`workflow-runtime.init:${databasePath}`);
         return {
+          bindPi() {
+            steps.push('workflow-runtime.bindPi');
+          },
           async start() {
             steps.push('workflow-runtime.start');
           },
           async stop() {
             steps.push('workflow-runtime.stop');
           },
+          registerDefinition() {},
+          workflowService,
           async startWorkflow() {
             return { instanceId: 'workflow-instance-1' };
           },
@@ -190,8 +215,9 @@ describe('boot sequence', () => {
           },
         };
       },
-      startApiServer() {
+      startApiServer(options) {
         steps.push('api.start');
+        expect(options.workflowService).toBe(workflowService);
         return {
           hostname: '127.0.0.1',
           port: 4111,
@@ -209,6 +235,7 @@ describe('boot sequence', () => {
       'warm-pool.init',
       'warm-pool.start',
       'workflow-runtime.init:/tmp/cove-v2-workflow-runtime/workflows.db',
+      'workflow-runtime.bindPi',
       'workflow-runtime.start',
       'scheduler.init',
       'scheduler.start',
@@ -225,6 +252,7 @@ describe('boot sequence', () => {
       'warm-pool.init',
       'warm-pool.start',
       'workflow-runtime.init:/tmp/cove-v2-workflow-runtime/workflows.db',
+      'workflow-runtime.bindPi',
       'workflow-runtime.start',
       'scheduler.init',
       'scheduler.start',
@@ -237,6 +265,248 @@ describe('boot sequence', () => {
       'warm-pool.stop',
       'db.close',
     ]);
+  });
+
+  it('passes workflowService plus the existing schedule seams into the API server', async () => {
+    const workflowService = {
+      listDefinitions: async () => [],
+      listInstances: async () => [],
+      startWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+      getWorkflow: async () => null,
+      signalWorkflow: async () => {},
+      terminateWorkflow: async () => {},
+      waitForWorkflow: async () => {
+        throw new Error('not implemented');
+      },
+      startScheduledWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+      rollbackWorkflow: async () => {},
+    };
+    const sharedStartWorkflow = async () => ({ instanceId: 'workflow-instance-1' });
+    const sharedRollbackWorkflow = async () => {};
+    let startApiServerArgs:
+      | {
+          workflowService?: unknown;
+          startWorkflow?: unknown;
+          rollbackWorkflow?: unknown;
+        }
+      | undefined;
+    const db = {
+      close() {},
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        return db;
+      },
+      migrate() {},
+      async cleanupOrphans() {},
+      createWarmPool() {
+        return {
+          async start() {},
+          async stop() {},
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      createWorkflowRuntime() {
+        return {
+          bindPi() {},
+          async start() {},
+          async stop() {},
+          registerDefinition() {},
+          workflowService,
+          startWorkflow: sharedStartWorkflow,
+          rollbackWorkflow: sharedRollbackWorkflow,
+        };
+      },
+      createScheduler() {
+        return {
+          async start() {},
+          async stop() {},
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {},
+        };
+      },
+      startApiServer(options) {
+        startApiServerArgs = options;
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {},
+        };
+      },
+    });
+
+    try {
+      expect(startApiServerArgs?.workflowService).toBe(workflowService);
+      expect(startApiServerArgs?.startWorkflow).toBe(sharedStartWorkflow);
+      expect(startApiServerArgs?.rollbackWorkflow).toBe(sharedRollbackWorkflow);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('computes a container-facing workflow API base URL from the bound server origin', async () => {
+    const db = {
+      close() {},
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        return db;
+      },
+      migrate() {},
+      async cleanupOrphans() {},
+      createWarmPool() {
+        return {
+          async start() {},
+          async stop() {},
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      createWorkflowRuntime() {
+        return {
+          bindPi() {},
+          async start() {},
+          async stop() {},
+          registerDefinition() {},
+          workflowService: {
+            listDefinitions: async () => [],
+            listInstances: async () => [],
+            startWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+            getWorkflow: async () => null,
+            signalWorkflow: async () => {},
+            terminateWorkflow: async () => {},
+            waitForWorkflow: async () => {
+              throw new Error('not implemented');
+            },
+            startScheduledWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+            rollbackWorkflow: async () => {},
+          },
+          async startWorkflow() {
+            return { instanceId: 'workflow-instance-1' };
+          },
+          async rollbackWorkflow() {},
+        };
+      },
+      createScheduler() {
+        return {
+          async start() {},
+          async stop() {},
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {},
+        };
+      },
+      startApiServer() {
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {},
+        };
+      },
+    });
+
+    try {
+      expect(process.env.COVE_WORKFLOW_API_BASE_URL).toBe('http://host.docker.internal:4111');
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('preserves non-loopback server hostnames when computing the workflow API base URL', async () => {
+    const db = {
+      close() {},
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        return db;
+      },
+      migrate() {},
+      async cleanupOrphans() {},
+      createWarmPool() {
+        return {
+          async start() {},
+          async stop() {},
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      createWorkflowRuntime() {
+        return {
+          bindPi() {},
+          async start() {},
+          async stop() {},
+          registerDefinition() {},
+          workflowService: {
+            listDefinitions: async () => [],
+            listInstances: async () => [],
+            startWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+            getWorkflow: async () => null,
+            signalWorkflow: async () => {},
+            terminateWorkflow: async () => {},
+            waitForWorkflow: async () => {
+              throw new Error('not implemented');
+            },
+            startScheduledWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+            rollbackWorkflow: async () => {},
+          },
+          async startWorkflow() {
+            return { instanceId: 'workflow-instance-1' };
+          },
+          async rollbackWorkflow() {},
+        };
+      },
+      createScheduler() {
+        return {
+          async start() {},
+          async stop() {},
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {},
+        };
+      },
+      startApiServer() {
+        return {
+          hostname: 'cove-host.internal',
+          port: 4222,
+          async stop() {},
+        };
+      },
+    });
+
+    try {
+      expect(process.env.COVE_WORKFLOW_API_BASE_URL).toBe('http://cove-host.internal:4222');
+    } finally {
+      await runtime.stop();
+    }
   });
 
   it('starts the Phase 1 services in order', async () => {
@@ -893,10 +1163,14 @@ mock.module('../src/jobs/cron-scheduler.ts', () => ({
   getRegisteredStartWorkflow() {
     return null;
   },
+  getRegisteredWorkflowService() {
+    return null;
+  },
   removeSchedule() {},
   registerRollbackWorkflow() {},
   registerRunAgentPrompt() {},
   registerStartWorkflow() {},
+  registerWorkflowService() {},
   setScheduleRuntimeSync(sync) {
     events.push(sync == null ? 'sync.clear' : 'sync.set');
   },
@@ -988,6 +1262,7 @@ let createSchedulerArgs;
 let createRunAgentPromptArgs;
 let ensureSessionRuntimeArgs;
 let registerRunAgentPromptArgs;
+let registerWorkflowServiceArgs;
 const sharedRunAgentPrompt = async () => ({
   content: 'ok',
   sessionId: 'session-1',
@@ -1031,12 +1306,18 @@ mock.module('../src/jobs/cron-scheduler.ts', () => ({
   getRegisteredStartWorkflow() {
     return null;
   },
+  getRegisteredWorkflowService() {
+    return null;
+  },
   removeSchedule() {},
   registerRollbackWorkflow() {},
   registerRunAgentPrompt(runAgentPrompt) {
     registerRunAgentPromptArgs = runAgentPrompt;
   },
   registerStartWorkflow() {},
+  registerWorkflowService(workflowService) {
+    registerWorkflowServiceArgs = workflowService;
+  },
   setScheduleRuntimeSync() {},
   upsertSchedule() {},
 }));
@@ -1087,6 +1368,7 @@ describe('default scheduler runAgentPrompt isolation', () => {
       expect(createRunAgentPromptArgs).toBeDefined();
       expect(ensureSessionRuntimeArgs).toMatchObject({ db });
       expect(registerRunAgentPromptArgs).toBe(sharedRunAgentPrompt);
+      expect(registerWorkflowServiceArgs).toBeDefined();
       expect(createSchedulerArgs).toEqual({ db });
     } finally {
       await runtime.stop();
@@ -1123,8 +1405,22 @@ import { describe, expect, it, mock } from 'bun:test';
 import { Database } from 'bun:sqlite';
 
 let registerStartWorkflowArgs;
+let registerWorkflowServiceArgs;
 let startApiServerArgs;
 const sharedStartWorkflow = async () => ({ instanceId: 'workflow-instance-1' });
+const sharedWorkflowService = {
+  listDefinitions: async () => [],
+  listInstances: async () => [],
+  startWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+  getWorkflow: async () => null,
+  signalWorkflow: async () => {},
+  terminateWorkflow: async () => {},
+  waitForWorkflow: async () => {
+    throw new Error('not implemented');
+  },
+  startScheduledWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+  rollbackWorkflow: async () => {},
+};
 
 mock.module('../src/jobs/cron-scheduler.ts', () => ({
   createScheduler() {
@@ -1144,11 +1440,17 @@ mock.module('../src/jobs/cron-scheduler.ts', () => ({
   getRegisteredStartWorkflow() {
     return null;
   },
+  getRegisteredWorkflowService() {
+    return null;
+  },
   removeSchedule() {},
   registerRollbackWorkflow() {},
   registerRunAgentPrompt() {},
   registerStartWorkflow(startWorkflow) {
     registerStartWorkflowArgs = startWorkflow;
+  },
+  registerWorkflowService(workflowService) {
+    registerWorkflowServiceArgs = workflowService;
   },
   setScheduleRuntimeSync() {},
   upsertSchedule() {},
@@ -1184,8 +1486,11 @@ describe('workflow starter boot isolation', () => {
       },
       createWorkflowRuntime() {
         return {
+          bindPi() {},
           async start() {},
           async stop() {},
+          registerDefinition() {},
+          workflowService: sharedWorkflowService,
           startWorkflow: sharedStartWorkflow,
           async rollbackWorkflow() {},
         };
@@ -1207,6 +1512,7 @@ describe('workflow starter boot isolation', () => {
 
     try {
       expect(registerStartWorkflowArgs).toBe(sharedStartWorkflow);
+      expect(registerWorkflowServiceArgs).toBe(sharedWorkflowService);
       expect(startApiServerArgs.startWorkflow).toBe(sharedStartWorkflow);
     } finally {
       await runtime.stop();
@@ -1313,10 +1619,14 @@ mock.module('../src/jobs/cron-scheduler.ts', () => ({
   getRegisteredStartWorkflow() {
     return null;
   },
+  getRegisteredWorkflowService() {
+    return null;
+  },
   removeSchedule() {},
   registerRollbackWorkflow() {},
   registerRunAgentPrompt() {},
   registerStartWorkflow() {},
+  registerWorkflowService() {},
   setScheduleRuntimeSync() {},
   upsertSchedule() {},
 }));

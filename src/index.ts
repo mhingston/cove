@@ -15,6 +15,7 @@ import {
   registerRollbackWorkflow,
   registerRunAgentPrompt,
   registerStartWorkflow,
+  registerWorkflowService,
   setScheduleRuntimeSync,
   type SchedulerRuntimeSync,
 } from './jobs/cron-scheduler.ts';
@@ -25,10 +26,12 @@ import { openInboundDb, writeInboundMessage } from './session/inbound.ts';
 import { openOutboundDb } from './session/outbound.ts';
 import { createEnsureSessionRuntime } from './session/runtime.ts';
 import { createWorkflowRuntime as createDefaultWorkflowRuntime, type WorkflowRuntime } from './workflows/runtime.ts';
+import { createWorkflowSessionBindings } from './workflows/session-bindings.ts';
 import type { ApiServer, Scheduler, SweepHandle, WarmPool } from './shared/types.ts';
 import type { ChatHandlerContext, ChatMessage, SessionConfig } from './shared/types.ts';
 import type { ScheduleRollbackWorkflow } from './shared/types.ts';
 import type { ScheduleStartWorkflow } from './shared/types.ts';
+import type { WorkflowService } from './workflows/bridge.ts';
 import { createWarmPool as createDefaultWarmPool } from './warm-pool.ts';
 
 export type BootRuntime = {
@@ -48,6 +51,7 @@ export type BootDependencies = {
     chat?: ChatHandlerContext;
     startWorkflow?: ScheduleStartWorkflow;
     rollbackWorkflow?: ScheduleRollbackWorkflow;
+    workflowService?: WorkflowService;
   }): ApiServer;
 };
 
@@ -299,6 +303,16 @@ function startSweep(_db: Database): SweepHandle {
   });
 }
 
+function resolveContainerFacingWorkflowApiBaseUrl(origin: string): string {
+  const url = new URL(origin);
+
+  if (['localhost', '127.0.0.1', '::1', '0.0.0.0'].includes(url.hostname)) {
+    url.hostname = 'host.docker.internal';
+  }
+
+  return url.origin;
+}
+
 const defaultDependencies: BootDependencies = {
   getDb,
   migrate,
@@ -342,20 +356,27 @@ export async function boot(overrides: Partial<BootDependencies> = {}): Promise<B
     cleanupActions.unshift(() => warmPool.stop());
     await warmPool.start();
 
-    const workflowRuntime = dependencies.createWorkflowRuntime(path.join(getStateDir(), 'workflows.db'));
-    cleanupActions.unshift(() => workflowRuntime.stop());
-    await workflowRuntime.start();
-    registerStartWorkflow(workflowRuntime.startWorkflow);
-    cleanupActions.unshift(() => registerStartWorkflow(null));
-    registerRollbackWorkflow(workflowRuntime.rollbackWorkflow);
-    cleanupActions.unshift(() => registerRollbackWorkflow(null));
-
     const ensureSessionRuntime = createEnsureSessionRuntime({
       db,
       warmPool,
       imageName: getImageName(),
       centralDbPath: path.join(getStateDir(), 'cove.db'),
     });
+
+    const workflowRuntime = dependencies.createWorkflowRuntime(path.join(getStateDir(), 'workflows.db'));
+    workflowRuntime.bindPi(createWorkflowSessionBindings({
+      db,
+      stateDir: getStateDir(),
+      ensureSessionRuntime,
+    }));
+    cleanupActions.unshift(() => workflowRuntime.stop());
+    await workflowRuntime.start();
+    registerStartWorkflow(workflowRuntime.startWorkflow);
+    cleanupActions.unshift(() => registerStartWorkflow(null));
+    registerRollbackWorkflow(workflowRuntime.rollbackWorkflow);
+    cleanupActions.unshift(() => registerRollbackWorkflow(null));
+    registerWorkflowService(workflowRuntime.workflowService);
+    cleanupActions.unshift(() => registerWorkflowService(null));
 
     const runAgentPrompt = createBootRunAgentPrompt({
       db,
@@ -381,7 +402,11 @@ export async function boot(overrides: Partial<BootDependencies> = {}): Promise<B
       chat: { ensureSessionRuntime },
       startWorkflow: workflowRuntime.startWorkflow,
       rollbackWorkflow: workflowRuntime.rollbackWorkflow,
+      workflowService: workflowRuntime.workflowService,
     });
+    process.env.COVE_WORKFLOW_API_BASE_URL = resolveContainerFacingWorkflowApiBaseUrl(
+      `http://${apiServer.hostname}:${apiServer.port}`,
+    );
     cleanupActions.unshift(() => apiServer.stop());
 
     return {

@@ -5,6 +5,7 @@ import { migrate } from '../../src/db/migrate.ts';
 import {
   CronScheduler,
   createScheduler,
+  registerWorkflowService,
   registerRunAgentPrompt,
   registerStartWorkflow,
   removeSchedule,
@@ -12,6 +13,7 @@ import {
   upsertSchedule,
 } from '../../src/jobs/cron-scheduler.ts';
 import { createSchedule, getSchedule } from '../../src/jobs/schedules.ts';
+import { createWorkflowService } from '../../src/workflows/bridge.ts';
 
 let db: Database | undefined;
 
@@ -93,6 +95,7 @@ async function waitFor(assertion: () => void | Promise<void>, attempts: number =
 }
 
 afterEach(async () => {
+  registerWorkflowService(null);
   registerRunAgentPrompt(null);
   registerStartWorkflow(null);
   setScheduleRuntimeSync(null);
@@ -137,7 +140,7 @@ describe('CronScheduler', () => {
     await scheduler.stop();
   });
 
-  it('createScheduler(db) uses the registered shared workflow starter seam', async () => {
+  it('createScheduler(db) prefers the registered shared workflowService seam for workflow schedules', async () => {
     db = new Database(':memory:');
     migrate(requireDb());
     insertAgentGroup('support');
@@ -152,35 +155,53 @@ describe('CronScheduler', () => {
       now: '2026-01-15T08:00:00.000Z',
     });
     setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
-    const startWorkflow = mock(async (input: {
-      schedule: { id: string; agent_group_id: string; prompt: string; mode?: string; config?: Record<string, unknown> | null };
-      input: Record<string, unknown> | null;
-    }) => {
-      expect(input.input).toEqual(null);
-      expect(input.schedule).toMatchObject({
-        id: schedule.id,
-        prompt: 'Workflow summary',
-        mode: 'workflow',
+    const startWorkflow = mock(async () => ({
+      instanceId: 'legacy-workflow-instance',
+    }));
+    const backendStartWorkflow = mock(async (input: { name: string; input?: { input: Record<string, unknown> | null } }) => {
+      expect(input.name).toBe('workflow-summary');
+      expect(input.input?.input).toEqual({
+        name: 'workflow-summary',
       });
 
       return {
         instanceId: 'workflow-instance-1',
       };
     });
-
+    requireDb().prepare('UPDATE schedules SET config = ? WHERE id = ?').run(JSON.stringify({ name: 'workflow-summary' }), schedule.id);
     registerStartWorkflow(startWorkflow);
+    registerWorkflowService(createWorkflowService({
+      async listDefinitions() {
+        return [];
+      },
+      async listInstances() {
+        return [];
+      },
+      startWorkflow: backendStartWorkflow,
+      async getWorkflow() {
+        return null;
+      },
+      async signalWorkflow() {},
+      async terminateWorkflow() {},
+      async waitForWorkflow() {
+        throw new Error('not used');
+      },
+      async rollbackWorkflow() {},
+    }));
     const scheduler = createScheduler(requireDb()) as CronScheduler;
     expect(scheduler).toBeInstanceOf(CronScheduler);
 
     await scheduler.start();
 
     await waitFor(() => {
-      expect(startWorkflow).toHaveBeenCalledTimes(1);
+      expect(backendStartWorkflow).toHaveBeenCalledTimes(1);
       expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
         id: schedule.id,
         last_run_at: expect.any(String),
       });
     });
+
+    expect(startWorkflow).not.toHaveBeenCalled();
 
     await scheduler.stop();
   });
@@ -459,6 +480,145 @@ describe('CronScheduler', () => {
     expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
       last_run_at: '2026-01-15T09:00:00.000Z',
       next_run_at: '2026-01-15T10:00:00.000Z',
+    });
+
+    await scheduler.stop();
+  });
+
+  it('prefers workflowService.startScheduledWorkflow over the legacy startWorkflow seam for due workflow schedules', async () => {
+    db = new Database(':memory:');
+    migrate(requireDb());
+    insertAgentGroup('support');
+    const controlledSleep = createControlledSleep();
+    const schedule = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '0 10 * * *',
+        prompt: 'Workflow summary',
+        mode: 'workflow',
+        config: {
+          name: 'daily-summary',
+          workflow: 'fallback-name',
+          notify: true,
+        },
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+    setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
+    const legacyStartWorkflow = mock(async () => ({
+      instanceId: 'legacy-workflow-instance',
+    }));
+    const backendStartWorkflow = mock(async (input: { name: string; input?: { input: Record<string, unknown> | null } }) => {
+      expect(input.name).toBe('daily-summary');
+      expect(input.input?.input).toEqual({
+        name: 'daily-summary',
+        workflow: 'fallback-name',
+        notify: true,
+      });
+
+      return {
+        instanceId: 'workflow-instance-1',
+      };
+    });
+    const workflowService = createWorkflowService({
+      async listDefinitions() {
+        return [];
+      },
+      async listInstances() {
+        return [];
+      },
+      startWorkflow: backendStartWorkflow,
+      async getWorkflow() {
+        return null;
+      },
+      async signalWorkflow() {},
+      async terminateWorkflow() {},
+      async waitForWorkflow() {
+        throw new Error('not used');
+      },
+      async rollbackWorkflow() {},
+    });
+    const scheduler = new CronScheduler({
+      db: requireDb(),
+      now: () => new Date('2026-01-15T09:00:00.000Z'),
+      sleep: controlledSleep.sleep,
+      startWorkflow: legacyStartWorkflow,
+      workflowService,
+    });
+
+    await scheduler.start();
+
+    await waitFor(() => {
+      expect(backendStartWorkflow).toHaveBeenCalledTimes(1);
+      expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
+        last_run_at: '2026-01-15T09:00:00.000Z',
+        next_run_at: '2026-01-15T10:00:00.000Z',
+      });
+    });
+
+    expect(legacyStartWorkflow).not.toHaveBeenCalled();
+
+    await scheduler.stop();
+  });
+
+  it('records failed workflow runs when the shared workflowService path rejects missing workflow names', async () => {
+    db = new Database(':memory:');
+    migrate(requireDb());
+    insertAgentGroup('support');
+    const controlledSleep = createControlledSleep();
+    const schedule = createSchedule({
+      db: requireDb(),
+      input: {
+        agent_group_id: 'support',
+        cron_expr: '*/5 * * * *',
+        prompt: 'Workflow summary',
+        mode: 'workflow',
+        config: {
+          notify: true,
+        },
+      },
+      now: '2026-01-15T08:00:00.000Z',
+    });
+    setNextRunAt(schedule.id, '2026-01-15T09:00:00.000Z');
+    let currentTime = '2026-01-15T09:00:00.000Z';
+    const workflowService = createWorkflowService({
+      async listDefinitions() {
+        return [];
+      },
+      async listInstances() {
+        return [];
+      },
+      async startWorkflow() {
+        currentTime = '2026-01-15T09:03:00.000Z';
+        return {
+          instanceId: 'workflow-instance-1',
+        };
+      },
+      async getWorkflow() {
+        return null;
+      },
+      async signalWorkflow() {},
+      async terminateWorkflow() {},
+      async waitForWorkflow() {
+        throw new Error('not used');
+      },
+      async rollbackWorkflow() {},
+    });
+    const scheduler = new CronScheduler({
+      db: requireDb(),
+      now: () => new Date(currentTime),
+      sleep: controlledSleep.sleep,
+      workflowService,
+    });
+
+    await scheduler.start();
+
+    await waitFor(() => {
+      expect(getSchedule({ db: requireDb(), id: schedule.id })).toMatchObject({
+        last_run_at: '2026-01-15T09:00:00.000Z',
+        next_run_at: '2026-01-15T09:05:00.000Z',
+      });
     });
 
     await scheduler.stop();

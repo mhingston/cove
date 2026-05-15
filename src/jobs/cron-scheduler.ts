@@ -2,6 +2,7 @@ import type { Database } from 'bun:sqlite';
 
 import type { Scheduler } from '../shared/types.ts';
 import type { ScheduleRollbackWorkflow, ScheduleStartWorkflow } from '../shared/types.ts';
+import type { WorkflowService } from '../workflows/bridge.ts';
 import { executeSchedule, hasWorkflowRollback } from './execute-schedule.ts';
 import { createRunAgentPrompt } from './run-agent-prompt.ts';
 import {
@@ -52,6 +53,7 @@ let scheduleRuntimeSync: SchedulerRuntimeSync | null = null;
 let registeredRunAgentPrompt: RunAgentPrompt | null = null;
 let registeredStartWorkflow: ScheduleStartWorkflow | null = null;
 let registeredRollbackWorkflow: ScheduleRollbackWorkflow | null = null;
+let registeredWorkflowService: WorkflowService | null = null;
 
 export function setScheduleRuntimeSync(sync: SchedulerRuntimeSync | null): void {
   scheduleRuntimeSync = sync;
@@ -71,6 +73,14 @@ export function registerStartWorkflow(startWorkflow: ScheduleStartWorkflow | nul
 
 export function getRegisteredStartWorkflow(): ScheduleStartWorkflow | null {
   return registeredStartWorkflow;
+}
+
+export function registerWorkflowService(workflowService: WorkflowService | null): void {
+  registeredWorkflowService = workflowService;
+}
+
+export function getRegisteredWorkflowService(): WorkflowService | null {
+  return registeredWorkflowService;
 }
 
 export function registerRollbackWorkflow(rollbackWorkflow: ScheduleRollbackWorkflow | null): void {
@@ -98,6 +108,7 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
   #runAgentPrompt?: RunAgentPrompt;
   #startWorkflow?: ScheduleStartWorkflow;
   #rollbackWorkflow?: ScheduleRollbackWorkflow;
+  #workflowService?: WorkflowService;
   #running = false;
   #loop: Promise<void> | null = null;
   #waiting: Deferred | null = null;
@@ -111,6 +122,7 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
     runAgentPrompt?: RunAgentPrompt;
     startWorkflow?: ScheduleStartWorkflow;
     rollbackWorkflow?: ScheduleRollbackWorkflow;
+    workflowService?: WorkflowService;
   }) {
     this.#db = options.db;
     this.pollIntervalMs = options.pollIntervalMs ?? 30_000;
@@ -119,6 +131,7 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
     this.#runAgentPrompt = options.runAgentPrompt;
     this.#startWorkflow = options.startWorkflow;
     this.#rollbackWorkflow = options.rollbackWorkflow;
+    this.#workflowService = options.workflowService;
   }
 
   async start(): Promise<void> {
@@ -180,6 +193,7 @@ export class CronScheduler implements Scheduler, SchedulerRuntimeSync {
           runAgentPrompt: this.#runAgentPrompt,
           startWorkflow: this.#startWorkflow,
           rollbackWorkflow: this.#rollbackWorkflow,
+          workflowService: this.#workflowService,
         });
         const ranAt = 'lastRunAt' in result ? result.lastRunAt : this.#now().toISOString();
 
@@ -254,5 +268,6 @@ export function createScheduler(db: Database): Scheduler {
     runAgentPrompt: registeredRunAgentPrompt ?? undefined,
     startWorkflow: registeredStartWorkflow ?? undefined,
     rollbackWorkflow: registeredRollbackWorkflow ?? undefined,
+    workflowService: registeredWorkflowService ?? undefined,
   });
 }

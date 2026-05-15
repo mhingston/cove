@@ -373,7 +373,13 @@ describe('session runtime manager', () => {
 
     const ready = await ensureSessionRuntime({
       routed,
-      config: makeConfig({ extra_env: { EXTRA_FLAG: '1', COVE_SESSION_ID: 'stale' } }),
+      config: makeConfig({
+        extra_env: {
+          EXTRA_FLAG: '1',
+          COVE_SESSION_ID: 'stale',
+          COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+        },
+      }),
     });
 
     expect(ready).toBe(true);
@@ -390,6 +396,7 @@ describe('session runtime manager', () => {
       envVars: {
         WARM_ONLY: 'true',
         EXTRA_FLAG: '1',
+        COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
         COVE_SESSION_ID: routed.session.id,
       },
     });
@@ -522,7 +529,13 @@ describe('session runtime manager', () => {
 
     const ready = await ensureSessionRuntime({
       routed,
-      config: makeConfig({ workspace: '/workspace/override', extra_env: { EXTRA_FLAG: 'fallback' } }),
+      config: makeConfig({
+        workspace: '/workspace/override',
+        extra_env: {
+          EXTRA_FLAG: 'fallback',
+          COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+        },
+      }),
     });
 
     expect(ready).toBe(true);
@@ -536,6 +549,7 @@ describe('session runtime manager', () => {
       workspaceDir: '/workspace/override',
       envVars: {
         EXTRA_FLAG: 'fallback',
+        COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
         COVE_SESSION_ID: routed.session.id,
       },
     });
@@ -568,7 +582,12 @@ describe('session runtime manager', () => {
 
     const ready = await ensureSessionRuntime({
       routed,
-      config: makeConfig({ workspace: null, extra_env: null }),
+      config: makeConfig({
+        workspace: null,
+        extra_env: {
+          COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
+        },
+      }),
     });
 
     expect(ready).toBe(true);
@@ -580,6 +599,7 @@ describe('session runtime manager', () => {
       centralDbPath: '/tmp/cove.db',
       workspaceDir: undefined,
       envVars: {
+        COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
         COVE_SESSION_ID: routed.session.id,
       },
     });

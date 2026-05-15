@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { getContainerRuntimeBin } from '../container/detect.ts';
 import { getImageName } from '../container/image.ts';
 import type { ScheduleRollbackWorkflow, ScheduleRunAgentPrompt, ScheduleStartWorkflow } from '../shared/types.ts';
+import type { WorkflowService } from '../workflows/bridge.ts';
 import type { ScheduleRecord } from './schedules.ts';
 
 type AgentResult = {
@@ -82,8 +83,9 @@ export async function executeSchedule(options: {
   runAgentPrompt?: ScheduleRunAgentPrompt;
   startWorkflow?: ScheduleStartWorkflow;
   rollbackWorkflow?: ScheduleRollbackWorkflow;
+  workflowService?: WorkflowService;
 }): Promise<ScheduleExecutionResult | WorkflowScheduleExecutionResult> {
-  const { schedule, runAgentPrompt, startWorkflow, rollbackWorkflow } = options;
+  const { schedule, runAgentPrompt, startWorkflow, rollbackWorkflow, workflowService } = options;
 
   switch (schedule.mode) {
     case 'agent':
@@ -108,17 +110,26 @@ export async function executeSchedule(options: {
       };
     }
     case 'workflow':
-      if (startWorkflow == null) {
+      if (workflowService == null && startWorkflow == null) {
         throw new Error('startWorkflow is required for workflow schedules');
       }
 
+      const started = workflowService != null
+        ? await workflowService.startScheduledWorkflow({
+            schedule,
+            input: schedule.config,
+          })
+        : await startWorkflow!({
+            schedule,
+            input: schedule.config,
+          });
+
       return {
         mode: 'workflow',
-        rollbackWorkflow,
-        ...(await startWorkflow({
-          schedule,
-          input: schedule.config,
-        })),
+        ...((rollbackWorkflow ?? workflowService?.rollbackWorkflow) == null
+          ? {}
+          : { rollbackWorkflow: rollbackWorkflow ?? workflowService?.rollbackWorkflow }),
+        ...started,
       };
   }
 }
