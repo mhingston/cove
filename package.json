@@ -10,7 +10,9 @@
     "bench": "bun -e \"import { existsSync, readdirSync } from 'node:fs'; const hasBenchTests = existsSync('tests/performance') && readdirSync('tests/performance', { recursive: true }).some((entry) => String(entry).endsWith('.test.ts')); const args = ['bun', 'test', 'tests/performance']; if (!hasBenchTests) { console.log('No performance benchmarks yet.'); process.exit(0); } const result = Bun.spawnSync(args, { stdio: ['inherit', 'inherit', 'inherit'] }); process.exit(result.exitCode); \""
   },
   "dependencies": {
-    "@xenova/transformers": "^2.17.2"
+    "@mariozechner/pi-coding-agent": "*",
+    "@xenova/transformers": "^2.17.2",
+    "pi-onecli-extension": "*"
   },
   "devDependencies": {
     "@types/bun": "latest",

@@ -17,6 +17,30 @@ import {
 
 const tempDirs: string[] = [];
 const originalRuntimeBin = process.env.COVE_CONTAINER_RUNTIME_BIN;
+const gatewayEnvKeys = [
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'ONECLI_AGENT_NAME',
+  'ONECLI_URL',
+  'AWS_SECRET_ACCESS_KEY',
+] as const;
+const originalGatewayEnv = Object.fromEntries(
+  gatewayEnvKeys.map((key) => [key, process.env[key]]),
+) as Record<(typeof gatewayEnvKeys)[number], string | undefined>;
+
+function restoreEnvVar(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+    return;
+  }
+
+  process.env[key] = value;
+}
 
 function makeTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -31,6 +55,10 @@ afterEach(() => {
     delete process.env.COVE_CONTAINER_RUNTIME_BIN;
   } else {
     process.env.COVE_CONTAINER_RUNTIME_BIN = originalRuntimeBin;
+  }
+
+  for (const key of gatewayEnvKeys) {
+    restoreEnvVar(key, originalGatewayEnv[key]);
   }
 
   for (const dir of tempDirs.splice(0)) {
@@ -71,6 +99,87 @@ describe('container manager', () => {
     });
 
     expect(args).toContain('/tmp/cove-state/cove.db:/app/session/cove.db');
+  });
+
+  it('buildContainerArgs injects only allowlisted OneCLI gateway env from the host', () => {
+    process.env.HTTPS_PROXY = 'https://proxy.example';
+    process.env.http_proxy = 'http://proxy.example';
+    process.env.NODE_EXTRA_CA_CERTS = '/tmp/certs.pem';
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+    process.env.AWS_SECRET_ACCESS_KEY = 'should-not-leak';
+
+    const args = buildContainerArgs({
+      ...baseOptions,
+      envVars: {
+        COVE_SESSION_ID: 'live-1',
+      },
+    });
+
+    expect(args).toContain('HTTPS_PROXY=https://proxy.example');
+    expect(args).toContain('http_proxy=http://proxy.example');
+    expect(args).toContain('NODE_EXTRA_CA_CERTS=/tmp/certs.pem');
+    expect(args).toContain('ONECLI_AGENT_NAME=cove-agent');
+    expect(args).toContain('ONECLI_URL=https://onecli.example');
+    expect(args).toContain('COVE_SESSION_ID=live-1');
+    expect(args).not.toContain('AWS_SECRET_ACCESS_KEY=should-not-leak');
+  });
+
+  it('buildContainerArgs does not let container env overrides replace allowlisted host OneCLI gateway env', () => {
+    process.env.HTTPS_PROXY = 'https://proxy.example';
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+
+    const args = buildContainerArgs({
+      ...baseOptions,
+      envVars: {
+        HTTPS_PROXY: 'https://override-proxy.example',
+        ONECLI_AGENT_NAME: 'override-agent',
+        ONECLI_URL: 'https://override-onecli.example',
+        COVE_SESSION_ID: 'live-1',
+      },
+    });
+
+    expect(args).toContain('HTTPS_PROXY=https://proxy.example');
+    expect(args).toContain('ONECLI_AGENT_NAME=cove-agent');
+    expect(args).toContain('ONECLI_URL=https://onecli.example');
+    expect(args).not.toContain('HTTPS_PROXY=https://override-proxy.example');
+    expect(args).not.toContain('ONECLI_AGENT_NAME=override-agent');
+    expect(args).not.toContain('ONECLI_URL=https://override-onecli.example');
+  });
+
+  it('spawnContainer stores effective allowlisted OneCLI gateway env on the tracked container entry', () => {
+    const tmpDir = makeTempDir('cove-v2-manager-onecli-stored-env-');
+    const runtimePath = path.join(tmpDir, 'fake-runtime.sh');
+
+    fs.writeFileSync(
+      runtimePath,
+      '#!/bin/sh\nif [ "$1" = "--version" ]; then\n  exit 0\nfi\nexit 0\n',
+      'utf8',
+    );
+    fs.chmodSync(runtimePath, 0o755);
+    process.env.COVE_CONTAINER_RUNTIME_BIN = runtimePath;
+    process.env.HTTPS_PROXY = 'https://proxy.example';
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+    process.env.AWS_SECRET_ACCESS_KEY = 'should-not-leak';
+
+    const ok = spawnContainer({
+      imageName: 'cove-agent:latest',
+      containerName: 'cove-onecli-stored-env',
+      sessionId: 'sess-onecli-stored-env',
+      sessionDir: '/tmp/cove-onecli-stored-env',
+      envVars: { COVE_SESSION_ID: 'sess-onecli-stored-env' },
+    });
+
+    expect(ok).toBe(true);
+    expect(getActiveContainers().get('sess-onecli-stored-env')?.options.envVars).toEqual({
+      HTTPS_PROXY: 'https://proxy.example',
+      ONECLI_AGENT_NAME: 'cove-agent',
+      ONECLI_URL: 'https://onecli.example',
+      COVE_SESSION_ID: 'sess-onecli-stored-env',
+    });
+    expect(getActiveContainers().get('sess-onecli-stored-env')?.options.envVars).not.toHaveProperty('AWS_SECRET_ACCESS_KEY');
   });
 
   it('spawnContainer returns false when the runtime binary is unavailable', () => {

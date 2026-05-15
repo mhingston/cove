@@ -12,6 +12,30 @@ import { createSessionForThread } from '../../src/session/manager.ts';
 
 let db: Database | undefined;
 const stateDirs: string[] = [];
+const gatewayEnvKeys = [
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'ONECLI_AGENT_NAME',
+  'ONECLI_URL',
+  'AWS_SECRET_ACCESS_KEY',
+] as const;
+const originalGatewayEnv = Object.fromEntries(
+  gatewayEnvKeys.map((key) => [key, process.env[key]]),
+) as Record<(typeof gatewayEnvKeys)[number], string | undefined>;
+
+function restoreEnvVar(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+    return;
+  }
+
+  process.env[key] = value;
+}
 
 function makeStateDir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cove-v2-runtime-'));
@@ -146,6 +170,10 @@ afterEach(() => {
   db = undefined;
   getActiveContainers().clear();
   mock.restore();
+
+  for (const key of gatewayEnvKeys) {
+    restoreEnvVar(key, originalGatewayEnv[key]);
+  }
 
   for (const stateDir of stateDirs.splice(0)) {
     fs.rmSync(stateDir, { recursive: true, force: true });
@@ -475,7 +503,11 @@ describe('session runtime manager', () => {
     insertSession(routed);
 
     const release = mock(() => {});
-    const spawnContainer = mock(() => true);
+    let capturedSpawnOptions: { envVars?: Record<string, string> } | undefined;
+    const spawnContainer = mock((options) => {
+      capturedSpawnOptions = options;
+      return true;
+    });
     const ensureSessionRuntime = createEnsureSessionRuntime({
       db,
       warmPool: makeWarmPool({
@@ -521,7 +553,11 @@ describe('session runtime manager', () => {
     const routed = makeRoutedRequest({ stateDir, sessionDir: coldSessionDir, workspace: null });
     insertSession(routed);
 
-    const spawnContainer = mock(() => true);
+    let capturedSpawnOptions: { envVars?: Record<string, string> } | undefined;
+    const spawnContainer = mock((options) => {
+      capturedSpawnOptions = options;
+      return true;
+    });
     const ensureSessionRuntime = createEnsureSessionRuntime({
       db,
       warmPool: makeWarmPool(),
@@ -547,6 +583,57 @@ describe('session runtime manager', () => {
         COVE_SESSION_ID: routed.session.id,
       },
     });
+  });
+
+  it('includes allowlisted OneCLI gateway env in cold-spawn runtime env without leaking unrelated host env', async () => {
+    const stateDir = makeStateDir();
+    const coldSessionDir = path.join(stateDir, 'sessions', 'support', 'live-session');
+
+    process.env.HTTPS_PROXY = 'https://proxy.example';
+    process.env.http_proxy = 'http://proxy.example';
+    process.env.NODE_EXTRA_CA_CERTS = '/tmp/certs.pem';
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+    process.env.AWS_SECRET_ACCESS_KEY = 'should-not-leak';
+
+    db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup('support');
+
+    const routed = makeRoutedRequest({ stateDir, sessionDir: coldSessionDir });
+    insertSession(routed);
+
+    let capturedSpawnOptions: { envVars?: Record<string, string> } | undefined;
+    const spawnContainer = mock((options) => {
+      capturedSpawnOptions = options;
+      return true;
+    });
+    const ensureSessionRuntime = createEnsureSessionRuntime({
+      db,
+      warmPool: makeWarmPool(),
+      imageName: 'cove-agent:latest',
+      centralDbPath: '/tmp/cove.db',
+      spawnContainer,
+    });
+
+    const ready = await ensureSessionRuntime({
+      routed,
+      config: makeConfig({ extra_env: { EXTRA_FLAG: '1' } }),
+    });
+
+    expect(ready).toBe(true);
+    expect(spawnContainer).toHaveBeenCalledWith(expect.objectContaining({
+      envVars: {
+        EXTRA_FLAG: '1',
+        HTTPS_PROXY: 'https://proxy.example',
+        http_proxy: 'http://proxy.example',
+        NODE_EXTRA_CA_CERTS: '/tmp/certs.pem',
+        ONECLI_AGENT_NAME: 'cove-agent',
+        ONECLI_URL: 'https://onecli.example',
+        COVE_SESSION_ID: routed.session.id,
+      },
+    }));
+    expect(capturedSpawnOptions?.envVars).not.toHaveProperty('AWS_SECRET_ACCESS_KEY');
   });
 
   it('injects loaded persona into config extra_env and preserves existing values for cold spawn', async () => {
@@ -592,6 +679,164 @@ describe('session runtime manager', () => {
       },
     });
     expect(readAgentGroupSoul('support')).toBe('db persona');
+  });
+
+  it('preserves inherited OneCLI gateway env during warm adoption while overriding live-session keys', async () => {
+    const stateDir = makeStateDir();
+    const warmSessionDir = path.join(stateDir, 'warm', 'warm-onecli');
+
+    process.env.HTTPS_PROXY = 'https://different-host-proxy.example';
+    process.env.ONECLI_URL = 'https://different-host-onecli.example';
+
+    db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup('support');
+
+    const routed = makeRoutedRequest({ stateDir, sessionDir: path.join(stateDir, 'sessions', 'support', 'live-session') });
+    insertSession(routed);
+    trackContainer('warm-onecli', {
+      containerName: 'cove-warm-warm-onecli',
+      sessionDir: warmSessionDir,
+      envVars: {
+        HTTPS_PROXY: 'https://warm-proxy.example',
+        ONECLI_URL: 'https://warm-onecli.example',
+        ONECLI_AGENT_NAME: 'warm-agent',
+        COVE_SESSION_ID: 'warm-onecli',
+      },
+    });
+
+    const ensureSessionRuntime = createEnsureSessionRuntime({
+      db,
+      warmPool: makeWarmPool({
+        acquire: async () => ({
+          sessionId: 'warm-onecli',
+          containerName: 'cove-warm-warm-onecli',
+          sessionDir: warmSessionDir,
+        }),
+      }),
+      imageName: 'cove-agent:latest',
+      centralDbPath: '/tmp/cove.db',
+    });
+
+    const ready = await ensureSessionRuntime({
+      routed,
+      config: makeConfig({ extra_env: { EXTRA_FLAG: '1' } }),
+    });
+
+    expect(ready).toBe(true);
+    expect(getActiveContainers().get(routed.session.id)?.options.envVars).toEqual({
+      HTTPS_PROXY: 'https://warm-proxy.example',
+      ONECLI_URL: 'https://warm-onecli.example',
+      ONECLI_AGENT_NAME: 'warm-agent',
+      EXTRA_FLAG: '1',
+      COVE_SESSION_ID: routed.session.id,
+    });
+  });
+
+  it('does not let config extra_env override allowlisted OneCLI gateway env during cold spawn', async () => {
+    const stateDir = makeStateDir();
+    const coldSessionDir = path.join(stateDir, 'sessions', 'support', 'live-session');
+
+    process.env.HTTPS_PROXY = 'https://proxy.example';
+    process.env.ONECLI_AGENT_NAME = 'host-agent';
+    process.env.ONECLI_URL = 'https://host-onecli.example';
+
+    db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup('support');
+
+    const routed = makeRoutedRequest({ stateDir, sessionDir: coldSessionDir });
+    insertSession(routed);
+
+    let capturedSpawnOptions: { envVars?: Record<string, string> } | undefined;
+    const spawnContainer = mock((options) => {
+      capturedSpawnOptions = options;
+      return true;
+    });
+    const ensureSessionRuntime = createEnsureSessionRuntime({
+      db,
+      warmPool: makeWarmPool(),
+      imageName: 'cove-agent:latest',
+      centralDbPath: '/tmp/cove.db',
+      spawnContainer,
+    });
+
+    const ready = await ensureSessionRuntime({
+      routed,
+      config: makeConfig({
+        extra_env: {
+          EXTRA_FLAG: '1',
+          HTTPS_PROXY: 'https://config-proxy.example',
+          ONECLI_AGENT_NAME: 'config-agent',
+          ONECLI_URL: 'https://config-onecli.example',
+        },
+      }),
+    });
+
+    expect(ready).toBe(true);
+    expect(capturedSpawnOptions?.envVars).toEqual({
+      HTTPS_PROXY: 'https://proxy.example',
+      ONECLI_AGENT_NAME: 'host-agent',
+      ONECLI_URL: 'https://host-onecli.example',
+      EXTRA_FLAG: '1',
+      COVE_SESSION_ID: routed.session.id,
+    });
+  });
+
+  it('does not let config extra_env override inherited OneCLI gateway env during warm adoption', async () => {
+    const stateDir = makeStateDir();
+    const warmSessionDir = path.join(stateDir, 'warm', 'warm-onecli-locked');
+
+    db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup('support');
+
+    const routed = makeRoutedRequest({ stateDir, sessionDir: path.join(stateDir, 'sessions', 'support', 'live-session') });
+    insertSession(routed);
+    trackContainer('warm-onecli-locked', {
+      containerName: 'cove-warm-warm-onecli-locked',
+      sessionDir: warmSessionDir,
+      envVars: {
+        HTTPS_PROXY: 'https://warm-proxy.example',
+        ONECLI_URL: 'https://warm-onecli.example',
+        ONECLI_AGENT_NAME: 'warm-agent',
+        COVE_SESSION_ID: 'warm-onecli-locked',
+      },
+    });
+
+    const ensureSessionRuntime = createEnsureSessionRuntime({
+      db,
+      warmPool: makeWarmPool({
+        acquire: async () => ({
+          sessionId: 'warm-onecli-locked',
+          containerName: 'cove-warm-warm-onecli-locked',
+          sessionDir: warmSessionDir,
+        }),
+      }),
+      imageName: 'cove-agent:latest',
+      centralDbPath: '/tmp/cove.db',
+    });
+
+    const ready = await ensureSessionRuntime({
+      routed,
+      config: makeConfig({
+        extra_env: {
+          EXTRA_FLAG: '1',
+          HTTPS_PROXY: 'https://config-proxy.example',
+          ONECLI_URL: 'https://config-onecli.example',
+          ONECLI_AGENT_NAME: 'config-agent',
+        },
+      }),
+    });
+
+    expect(ready).toBe(true);
+    expect(getActiveContainers().get(routed.session.id)?.options.envVars).toEqual({
+      HTTPS_PROXY: 'https://warm-proxy.example',
+      ONECLI_URL: 'https://warm-onecli.example',
+      ONECLI_AGENT_NAME: 'warm-agent',
+      EXTRA_FLAG: '1',
+      COVE_SESSION_ID: routed.session.id,
+    });
   });
 
   it('keeps an explicit config extra_env COVE_PERSONA instead of loading from the database', async () => {

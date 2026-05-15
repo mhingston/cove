@@ -11,6 +11,29 @@ import { openOutboundDb, readProcessingAck, writeProcessingAck } from '../../src
 import type { SessionConfig } from '../../src/shared/types.ts';
 
 const tempDirs: string[] = [];
+const gatewayEnvKeys = [
+  'ONECLI_AGENT_NAME',
+  'ONECLI_URL',
+  'COVE_ONECLI_AUTH',
+] as const;
+const originalGatewayEnv = Object.fromEntries(
+  gatewayEnvKeys.map((key) => [key, process.env[key]]),
+) as Record<(typeof gatewayEnvKeys)[number], string | undefined>;
+
+function restoreEnvVar(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+    return;
+  }
+
+  process.env[key] = value;
+}
+
+function clearGatewayEnvForTest(): void {
+  for (const key of gatewayEnvKeys) {
+    delete process.env[key];
+  }
+}
 
 function makeTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -259,6 +282,12 @@ function createFakeDeps(options: {
 }
 
 afterEach(() => {
+  mock.restore();
+
+  for (const key of gatewayEnvKeys) {
+    restoreEnvVar(key, originalGatewayEnv[key]);
+  }
+
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -1261,6 +1290,7 @@ describe('container runner phase 5', () => {
     writeSessionConfig(sessionDir, {
       provider: 'anthropic',
       model: 'claude-runner',
+      api_key: 'runner-api-key',
       extra_env: {
         COVE_AGENT_GROUP_ID: 'group-default-extension-resolution',
         COVE_MCP_CONFIG: JSON.stringify({
@@ -1603,6 +1633,419 @@ describe('container runner phase 5', () => {
     expect(createAgentSessionCalls[0]?.authStorage).toBe(authInstances[0]);
     expect(createAgentSessionCalls[0]?.modelRegistry).toBe(registryCalls[0]?.registry);
     expect(createAgentSessionCalls[0]?.model?.authId).toBe(authInstances[0]?.id);
+  });
+
+  it('adds pi-onecli-extension to resource-loader extension paths for inherited OneCLI gateway runs', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-onecli-extension-');
+    const sessionId = 'sess-onecli-extension-1';
+    const resourceLoaders: Array<{
+      additionalExtensionPaths?: string[];
+    } | undefined> = [];
+
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey() {},
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession(sessionOptions: {
+        resourceLoader?: {
+          additionalExtensionPaths?: string[];
+        };
+      }) {
+        resourceLoaders.push(sessionOptions.resourceLoader);
+        const listeners = new Set<(event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void>();
+
+        return {
+          session: {
+            subscribe(handler: (event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void) {
+              listeners.add(handler);
+              return () => {
+                listeners.delete(handler);
+              };
+            },
+            async prompt(message: string) {
+              for (const listener of listeners) {
+                listener({
+                  type: 'message_update',
+                  assistantMessageEvent: {
+                    type: 'text_delta',
+                    delta: `SDK:${message}`,
+                  },
+                });
+              }
+            },
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+    });
+    writeUserMessage(sessionDir, 'Use inherited OneCLI auth.');
+
+    await runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    }, undefined, {
+      resolveInstalledPackageDir(packageName) {
+        return packageName === 'pi-onecli-extension' ? `/tmp/node_modules/${packageName}` : undefined;
+      },
+    });
+
+    expect(resourceLoaders).toContainEqual(expect.objectContaining({
+      additionalExtensionPaths: ['/tmp/node_modules/pi-onecli-extension'],
+    }));
+  });
+
+  it('does not treat persisted ONECLI config values as inherited gateway auth', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-onecli-persisted-config-only-');
+    const sessionId = 'sess-onecli-persisted-config-only-1';
+
+    clearGatewayEnvForTest();
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey() {},
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession() {
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        ONECLI_AGENT_NAME: 'persisted-agent',
+        ONECLI_URL: 'https://persisted-onecli.example',
+      },
+    });
+    writeUserMessage(sessionDir, 'This should still require credentials.');
+
+    await expect(runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    })).rejects.toThrow('Container agent startup requires inherited OneCLI gateway auth or API_KEY for anthropic/claude-runner.');
+  });
+
+  it('keeps API key fallback when inherited OneCLI gateway env is unavailable', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-api-key-fallback-');
+    const sessionId = 'sess-api-key-fallback-1';
+    const authCalls: Array<{ provider: string; apiKey: string | null | undefined }> = [];
+
+    clearGatewayEnvForTest();
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey(provider: string, apiKey: string) {
+              authCalls.push({ provider, apiKey });
+            },
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession() {
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+    });
+    writeUserMessage(sessionDir, 'Fallback to API key.');
+
+    await runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    });
+
+    expect(authCalls).toEqual([{ provider: 'anthropic', apiKey: 'runner-api-key' }]);
+  });
+
+  it('uses API key fallback when OneCLI auth is explicitly disabled even if inherited gateway env is present', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-onecli-disabled-api-key-fallback-');
+    const sessionId = 'sess-onecli-disabled-api-key-fallback-1';
+    const authCalls: Array<{ provider: string; apiKey: string | null | undefined }> = [];
+
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey(provider: string, apiKey: string) {
+              authCalls.push({ provider, apiKey });
+            },
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession() {
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+      extra_env: {
+        COVE_ONECLI_AUTH: 'false',
+      },
+    });
+    writeUserMessage(sessionDir, 'Fallback to API key when OneCLI is disabled.');
+
+    await runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    });
+
+    expect(authCalls).toEqual([{ provider: 'anthropic', apiKey: 'runner-api-key' }]);
+  });
+
+  it('fails with a clear startup error when the selected provider path has neither OneCLI gateway auth nor API key fallback', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-missing-credentials-');
+    const sessionId = 'sess-missing-credentials-1';
+
+    clearGatewayEnvForTest();
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey() {},
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession() {
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, 'This should fail without credentials.');
+
+    await expect(runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    })).rejects.toThrow('Container agent startup requires inherited OneCLI gateway auth or API_KEY for anthropic/claude-runner.');
+
+    expect(readOutboundRows(sessionDir)).toEqual([]);
+    expect(readAck(sessionDir, sessionId)).toBeNull();
+  });
+
+  it('fails before startup for auto provider paths that resolve to unsupported providers', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-auto-unsupported-provider-1');
+    const sessionId = 'sess-auto-unsupported-provider-1';
+
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey() {},
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession() {
+        throw new Error('createAgentSession should not be reached for unsupported providers');
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'auto',
+      model: 'openai/gpt-4o-mini',
+    });
+    writeUserMessage(sessionDir, 'This should fail for unsupported auto provider paths.');
+
+    await expect(runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    })).rejects.toThrow("Unsupported container agent provider 'openai'.");
+
+    expect(readOutboundRows(sessionDir)).toEqual([]);
+    expect(readAck(sessionDir, sessionId)).toBeNull();
   });
 
   it('throws setup failures without writing an assistant row or advancing ack state', async () => {

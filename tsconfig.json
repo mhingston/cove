@@ -5,6 +5,7 @@
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "strict": true,
+    "skipLibCheck": true,
     "noEmit": true,
     "types": ["bun"]
   },

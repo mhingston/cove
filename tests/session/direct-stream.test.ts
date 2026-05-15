@@ -431,6 +431,7 @@ describe('streamDirectSessionTokens', () => {
         config: {
           provider: 'anthropic',
           model: 'claude-request',
+          api_key: 'stream-api-key',
         },
         messages: [{ role: 'user', content: 'Use default runner' }],
       })) {

@@ -5,6 +5,7 @@ import { killContainer as defaultKillContainer } from '../container/kill.ts';
 import { loadPersona } from '../context/persona.ts';
 import {
   getActiveContainers,
+  getAllowlistedOneCliGatewayEnv,
   isContainerRunning as defaultIsContainerRunning,
   spawnContainer as defaultSpawnContainer,
   type ContainerStartOptions,
@@ -51,6 +52,7 @@ function injectPersonaIntoConfig(config: SessionConfig, agentGroupId: string, db
 function buildRuntimeEnv(config: SessionConfig, sessionId: string): Record<string, string> {
   return {
     ...(config.extra_env ?? {}),
+    ...getAllowlistedOneCliGatewayEnv(),
     COVE_SESSION_ID: sessionId,
   };
 }
@@ -64,7 +66,9 @@ function buildAdoptedRuntimeEnv(options: {
 
   return {
     ...warmEnv,
-    ...buildRuntimeEnv(options.config, options.liveSessionId),
+    ...(options.config.extra_env ?? {}),
+    ...getAllowlistedOneCliGatewayEnv(warmEnv),
+    COVE_SESSION_ID: options.liveSessionId,
   };
 }
 

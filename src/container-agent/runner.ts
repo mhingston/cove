@@ -1,6 +1,5 @@
 import { Database } from 'bun:sqlite';
 import fs from 'node:fs';
-import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,10 +18,8 @@ import {
   writeProcessingAck,
 } from '../session/outbound.ts';
 import { createCoveTools, type ToolDefinition } from './tools.ts';
-import { setupContainerAgent } from './agent-setup.ts';
+import { resolveContainerAgentModel, setupContainerAgent } from './agent-setup.ts';
 import type { EmbedTexts } from '../context/external.ts';
-
-const require = createRequire(import.meta.url);
 
 type PermissionTier = 'auto' | 'prompt' | 'confirm';
 
@@ -125,6 +122,12 @@ type CreateSessionOptions = {
   sessionStateDir?: string;
   resourceLoader?: RunnerResourceLoader;
   customTools?: ToolDefinition[];
+};
+
+type RunnerGatewayAuthState = {
+  isEnabled: boolean;
+  isSupported: boolean;
+  hasInheritedGatewayEnv: boolean;
 };
 
 export type ContainerSessionDeps = {
@@ -288,15 +291,75 @@ function toText(value: unknown): string {
 }
 
 function resolveInstalledPackageDir(packageName: string): string | undefined {
-  try {
-    const packageJsonPath = require.resolve(`${packageName}/package.json`, {
-      paths: [process.cwd(), path.dirname(fileURLToPath(import.meta.url))],
-    });
+  const candidateRoots = [
+    path.join(process.cwd(), 'node_modules'),
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'node_modules'),
+  ];
 
-    return path.dirname(packageJsonPath);
-  } catch {
-    return undefined;
+  for (const root of candidateRoots) {
+    const candidate = path.join(root, packageName);
+
+    try {
+      if (fs.statSync(candidate).isDirectory()) {
+        return fs.realpathSync(candidate);
+      }
+    } catch {
+      // Try the next candidate root.
+    }
   }
+
+  return undefined;
+}
+
+function getInheritedGatewayEnv(): Record<string, string> {
+  return {
+    ONECLI_AGENT_NAME: process.env.ONECLI_AGENT_NAME ?? '',
+    ONECLI_URL: process.env.ONECLI_URL ?? '',
+  };
+}
+
+function isOneCliAuthEnabled(config: SessionConfig): boolean {
+  const rawValue = config.extra_env?.COVE_ONECLI_AUTH ?? process.env.COVE_ONECLI_AUTH;
+
+  if (rawValue == null) {
+    return true;
+  }
+
+  const normalized = rawValue.trim().toLowerCase();
+  return normalized !== '0' && normalized !== 'false' && normalized !== 'off' && normalized !== 'disabled';
+}
+
+function getGatewayAuthState(config: SessionConfig): RunnerGatewayAuthState {
+  const inheritedGatewayEnv = getInheritedGatewayEnv();
+
+  return {
+    isEnabled: isOneCliAuthEnabled(config),
+    isSupported: config.provider === 'anthropic' || config.provider === 'auto',
+    hasInheritedGatewayEnv: inheritedGatewayEnv.ONECLI_AGENT_NAME !== '' && inheritedGatewayEnv.ONECLI_URL !== '',
+  };
+}
+
+function getRunnerApiKey(config: SessionConfig): string | null {
+  const apiKey = config.api_key?.trim();
+  return apiKey == null || apiKey === '' ? null : apiKey;
+}
+
+function validateRunnerCredentials(config: SessionConfig): void {
+  const gateway = getGatewayAuthState(config);
+
+  if (gateway.isEnabled && gateway.isSupported && gateway.hasInheritedGatewayEnv) {
+    return;
+  }
+
+  if (getRunnerApiKey(config) != null) {
+    return;
+  }
+
+  const resolvedModel = resolveContainerAgentModel({
+    provider: config.provider,
+    model: config.model,
+  });
+  throw new Error(`Container agent startup requires inherited OneCLI gateway auth or API_KEY for ${resolvedModel.id}.`);
 }
 
 function prepareMcpAgentDir(config: SessionConfig, sessionStateDir: string, resolvePackageDir: (packageName: string) => string | undefined): {
@@ -513,18 +576,23 @@ function createPendingApproval(db: Database, options: {
   return { id, expires_at: expiresAt };
 }
 
-function loadCodingAgentSdk(): CodingAgentSdkModule {
-  return require('@mariozechner/pi-coding-agent') as CodingAgentSdkModule;
+async function loadCodingAgentSdk(): Promise<CodingAgentSdkModule> {
+  return await import('@mariozechner/pi-coding-agent') as CodingAgentSdkModule;
 }
 
 async function createDefaultSession(options: CreateSessionOptions): Promise<RunnerSessionResult> {
-  const sdk = loadCodingAgentSdk();
+  const sdk = await loadCodingAgentSdk();
   let setupAuthStorage: ReturnType<typeof sdk.AuthStorage.inMemory> | undefined;
   let setupModelRegistry: ReturnType<typeof sdk.ModelRegistry.inMemory> | undefined;
+  const gatewayAuth = getGatewayAuthState(options.config);
+
+  validateRunnerCredentials(options.config);
   const setup = await setupContainerAgent({
     provider: options.config.provider,
     model: options.config.model,
-    apiKey: options.config.api_key,
+    apiKey: gatewayAuth.isEnabled && gatewayAuth.isSupported && gatewayAuth.hasInheritedGatewayEnv
+      ? null
+      : getRunnerApiKey(options.config),
     sessionId: options.sessionId ?? getConfiguredSessionId(options.config),
     sessionStateDir: options.sessionStateDir,
   }, {
@@ -600,7 +668,12 @@ function buildResourceLoader(options: {
   const agentGroupId = getAgentGroupId(options.config);
   const mcpAgentDir = prepareMcpAgentDir(options.config, options.sessionStateDir, options.resolveInstalledPackageDir);
   const subagentPackageDir = agentGroupId == null ? undefined : options.resolveInstalledPackageDir('pi-subagents');
-  const additionalExtensionPaths = [subagentPackageDir, mcpAgentDir?.packageDir].filter((value): value is string => value != null);
+  const gatewayAuth = getGatewayAuthState(options.config);
+  const oneCliExtensionPackageDir = gatewayAuth.isEnabled && gatewayAuth.isSupported && gatewayAuth.hasInheritedGatewayEnv
+    ? options.resolveInstalledPackageDir('pi-onecli-extension')
+    : undefined;
+  const additionalExtensionPaths = [subagentPackageDir, mcpAgentDir?.packageDir, oneCliExtensionPackageDir]
+    .filter((value): value is string => value != null);
   const persona = agentGroupId == null || centralDbPath == null
     ? undefined
     : loadPersona(agentGroupId, {

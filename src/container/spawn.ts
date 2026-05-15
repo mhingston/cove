@@ -27,6 +27,18 @@ export type ContainerEntry = {
 
 const activeContainers = new Map<string, ContainerEntry>();
 
+const ALLOWLISTED_GATEWAY_ENV_KEYS = [
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'ONECLI_AGENT_NAME',
+  'ONECLI_URL',
+] as const;
+
 function getContainerKey(options: ContainerStartOptions): string {
   return options.sessionId ?? options.containerName;
 }
@@ -49,6 +61,29 @@ function markEntryExited(process: ChildProcess): void {
   }
 }
 
+export function getAllowlistedOneCliGatewayEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const gatewayEnv: Record<string, string> = {};
+
+  for (const key of ALLOWLISTED_GATEWAY_ENV_KEYS) {
+    const value = env[key];
+
+    if (value != null && value !== '') {
+      gatewayEnv[key] = value;
+    }
+  }
+
+  return gatewayEnv;
+}
+
+function resolveContainerEnvVars(options: ContainerStartOptions, env: NodeJS.ProcessEnv = process.env): Record<string, string> | undefined {
+  const envVars = {
+    ...(options.envVars ?? {}),
+    ...getAllowlistedOneCliGatewayEnv(env),
+  };
+
+  return Object.keys(envVars).length > 0 ? envVars : undefined;
+}
+
 export function buildContainerArgs(options: ContainerStartOptions): string[] {
   const args = ['run', '--rm', ...hostGatewayArgs(), '--name', options.containerName];
   const sessionKey = getContainerKey(options);
@@ -64,7 +99,9 @@ export function buildContainerArgs(options: ContainerStartOptions): string[] {
     args.push('-v', `${options.workspaceDir}:/workspace`);
   }
 
-  for (const [key, value] of Object.entries(options.envVars ?? {})) {
+  const envVars = resolveContainerEnvVars(options) ?? {};
+
+  for (const [key, value] of Object.entries(envVars)) {
     args.push('-e', `${key}=${value}`);
   }
 
@@ -83,12 +120,16 @@ export function spawnContainer(options: ContainerStartOptions): boolean {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const containerKey = getContainerKey(options);
+    const normalizedOptions = {
+      ...options,
+      envVars: resolveContainerEnvVars(options),
+    };
 
     activeContainers.set(containerKey, {
       process: container,
       name: options.containerName,
       startedAt: Date.now(),
-      options: copyOptions(options),
+      options: copyOptions(normalizedOptions),
       running: true,
     });
 
