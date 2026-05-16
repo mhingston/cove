@@ -49,6 +49,7 @@ async function bootWithDefaultWarmPool(options: {
   capturedChat: ChatHandlerContext | undefined;
   warmEntries: string[];
   log: string;
+  stateDir: string;
 }> {
   if (options.poolMin !== undefined) {
     process.env.COVE_POOL_MIN = options.poolMin;
@@ -110,6 +111,7 @@ async function bootWithDefaultWarmPool(options: {
         capturedChat,
         warmEntries: fs.readdirSync(path.join(stateDir, 'warm')),
         log: fs.readFileSync(logPath, 'utf8'),
+        stateDir,
       };
     } finally {
       await runtime.stop();
@@ -262,6 +264,118 @@ describe('boot sequence', () => {
       'sweep.stop',
       'scheduler.stop',
       'workflow-runtime.stop',
+      'warm-pool.stop',
+      'db.close',
+    ]);
+  });
+
+  it('stops tracked session containers during runtime shutdown', async () => {
+    const steps: string[] = [];
+    const db = {
+      close() {
+        steps.push('db.close');
+      },
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        steps.push('db.get');
+        return db;
+      },
+      migrate() {
+        steps.push('db.migrate');
+      },
+      async cleanupOrphans() {
+        steps.push('cleanup.orphans');
+      },
+      createWarmPool() {
+        steps.push('warm-pool.init');
+        return {
+          async start() {
+            steps.push('warm-pool.start');
+          },
+          async stop() {
+            steps.push('warm-pool.stop');
+          },
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      createWorkflowRuntime() {
+        return {
+          bindPi() {},
+          async start() {},
+          async stop() {
+            steps.push('workflow-runtime.stop');
+          },
+          registerDefinition() {},
+          workflowService: {
+            listDefinitions: async () => [],
+            listInstances: async () => [],
+            startWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+            getWorkflow: async () => null,
+            signalWorkflow: async () => {},
+            terminateWorkflow: async () => {},
+            waitForWorkflow: async () => {
+              throw new Error('not implemented');
+            },
+            startScheduledWorkflow: async () => ({ instanceId: 'workflow-instance-1' }),
+            rollbackWorkflow: async () => {},
+          },
+          async startWorkflow() {
+            return { instanceId: 'workflow-instance-1' };
+          },
+          async rollbackWorkflow() {},
+        };
+      },
+      createScheduler() {
+        return {
+          async start() {},
+          async stop() {
+            steps.push('scheduler.stop');
+          },
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {
+            steps.push('sweep.stop');
+          },
+        };
+      },
+      startApiServer() {
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {
+            steps.push('api.stop');
+          },
+        };
+      },
+      stopTrackedContainers() {
+        steps.push('containers.stop');
+      },
+    });
+
+    await runtime.stop();
+
+    expect(steps).toEqual([
+      'db.get',
+      'db.migrate',
+      'cleanup.orphans',
+      'warm-pool.init',
+      'warm-pool.start',
+      'api.stop',
+      'sweep.stop',
+      'scheduler.stop',
+      'workflow-runtime.stop',
+      'containers.stop',
       'warm-pool.stop',
       'db.close',
     ]);
@@ -923,7 +1037,7 @@ describe('boot sequence', () => {
   });
 
   it('builds the default warm pool and passes a live ensureSessionRuntime into the API server', async () => {
-    const { capturedChat, warmEntries, log } = await bootWithDefaultWarmPool({
+    const { capturedChat, warmEntries, log, stateDir } = await bootWithDefaultWarmPool({
       poolMin: '2',
       poolMax: '7',
     });
@@ -933,6 +1047,7 @@ describe('boot sequence', () => {
     expect(log).toContain('run');
     expect(log).toContain('--name');
     expect(log).toContain('cove-agent:test');
+    expect(log).toContain(path.join(stateDir, 'cove.db') + ':/app/session/cove.db');
   });
 
   it('uses warm-pool size defaults of 1 and 5 when pool env vars are unset', async () => {
@@ -1712,6 +1827,363 @@ describe('mixed-role replay safety isolation', () => {
       } finally {
         inboundDb.close();
       }
+    } finally {
+      await runtime.stop();
+    }
+  });
+});
+`;
+
+    fs.writeFileSync(tempTestPath, tempTestSource);
+
+    const result = Bun.spawnSync(['bun', 'test', tempTestPath], {
+      cwd: path.dirname(import.meta.dir),
+      env: process.env,
+      stderr: 'pipe',
+      stdout: 'pipe',
+    });
+
+    try {
+      const output = result.stdout.toString() + result.stderr.toString();
+      expect(result.exitCode, output).toBe(0);
+      expect(output).toContain('1 pass');
+    } finally {
+      fs.rmSync(tempTestPath, { force: true });
+    }
+  });
+
+  it('preserves a null stored model when the boot-built runAgentPrompt targets an agent group without a default model', async () => {
+    const tempTestPath = path.join(
+      path.dirname(import.meta.path),
+      `.scheduler-null-model-${crypto.randomUUID()}.test.ts`,
+    );
+    const tempTestSource = `
+import { afterAll, describe, expect, it, mock } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import fs from 'node:fs';
+
+import { openInboundDb } from '../src/session/inbound.ts';
+
+let createRunAgentPromptArgs;
+const sessionDir = '/tmp/cove-v2-scheduler-null-model-' + crypto.randomUUID();
+
+mock.module('../src/jobs/run-agent-prompt.ts', () => ({
+  createScheduleThreadId(scheduleId) {
+    return 'schedule:' + scheduleId;
+  },
+  createRunAgentPrompt(args) {
+    createRunAgentPromptArgs = args;
+    return async () => ({
+      content: 'ok',
+      sessionId: 'session-1',
+      threadId: 'schedule:schedule-1',
+      lastRunAt: '2026-01-15T09:00:00.000Z',
+    });
+  },
+}));
+
+mock.module('../src/session/runtime.ts', () => ({
+  createEnsureSessionRuntime() {
+    return async () => true;
+  },
+}));
+
+mock.module('../src/router.ts', () => ({
+  routeRequest() {
+    return {
+      agentGroup: {
+        id: 'support',
+        provider: 'anthropic',
+        model: null,
+        thinking: 'medium',
+        workspace: '/workspace/support',
+        permissions: '{}',
+        config: null,
+      },
+      threadId: 'schedule:schedule-1',
+      session: {
+        id: 'session-1',
+        agent_group_id: 'support',
+        thread_id: 'schedule:schedule-1',
+        session_file: sessionDir,
+        metadata: null,
+        created_at: '2026-01-15T08:00:00.000Z',
+        updated_at: '2026-01-15T08:00:00.000Z',
+      },
+    };
+  },
+}));
+
+mock.module('../src/jobs/cron-scheduler.ts', () => ({
+  createScheduler() {
+    return {
+      upsertSchedule() {},
+      removeSchedule() {},
+      async start() {},
+      async stop() {},
+    };
+  },
+  getRegisteredRunAgentPrompt() {
+    return null;
+  },
+  getRegisteredRollbackWorkflow() {
+    return null;
+  },
+  getRegisteredStartWorkflow() {
+    return null;
+  },
+  getRegisteredWorkflowService() {
+    return null;
+  },
+  removeSchedule() {},
+  registerRollbackWorkflow() {},
+  registerRunAgentPrompt() {},
+  registerStartWorkflow() {},
+  registerWorkflowService() {},
+  setScheduleRuntimeSync() {},
+  upsertSchedule() {},
+}));
+
+mock.module('../src/delivery.ts', () => ({
+  DeliveryTimeoutError: class DeliveryTimeoutError extends Error {},
+  pollForResponse() {
+    return Promise.resolve([]);
+  },
+}));
+
+const { boot } = await import('../src/index.ts?scheduler-null-model=' + ${JSON.stringify(crypto.randomUUID())});
+
+afterAll(() => {
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+});
+
+describe('null-model schedule isolation', () => {
+  it('writes a null model into session_config instead of fabricating the agent group id', async () => {
+    const db = {
+      close() {},
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        return db;
+      },
+      migrate() {},
+      async cleanupOrphans() {},
+      createWarmPool() {
+        return {
+          async start() {},
+          async stop() {},
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {},
+        };
+      },
+      startApiServer() {
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {},
+        };
+      },
+    });
+
+    try {
+      await createRunAgentPromptArgs.execute({
+        agent_group_id: 'support',
+        thread_id: 'schedule:schedule-1',
+        messages: [
+          { role: 'user', content: 'Run now' },
+        ],
+      });
+
+      const inboundDb = openInboundDb(sessionDir);
+
+      try {
+        const configRow = inboundDb.prepare('SELECT model FROM session_config').get() as { model: string | null } | null;
+        expect(configRow?.model).toBeNull();
+      } finally {
+        inboundDb.close();
+      }
+    } finally {
+      await runtime.stop();
+    }
+  });
+});
+`;
+
+    fs.writeFileSync(tempTestPath, tempTestSource);
+
+    const result = Bun.spawnSync(['bun', 'test', tempTestPath], {
+      cwd: path.dirname(import.meta.dir),
+      env: process.env,
+      stderr: 'pipe',
+      stdout: 'pipe',
+    });
+
+    try {
+      const output = result.stdout.toString() + result.stderr.toString();
+      expect(result.exitCode, output).toBe(0);
+      expect(output).toContain('1 pass');
+    } finally {
+      fs.rmSync(tempTestPath, { force: true });
+    }
+  });
+
+  it('fails the boot-built runAgentPrompt when the routed agent group runtime-prep config is invalid', async () => {
+    const tempTestPath = path.join(
+      path.dirname(import.meta.path),
+      `.scheduler-invalid-config-${crypto.randomUUID()}.test.ts`,
+    );
+    const tempTestSource = `
+import { describe, expect, it, mock } from 'bun:test';
+import { Database } from 'bun:sqlite';
+
+let createRunAgentPromptArgs;
+
+mock.module('../src/jobs/run-agent-prompt.ts', () => ({
+  createScheduleThreadId(scheduleId) {
+    return 'schedule:' + scheduleId;
+  },
+  createRunAgentPrompt(args) {
+    createRunAgentPromptArgs = args;
+    return async () => ({
+      content: 'ok',
+      sessionId: 'session-1',
+      threadId: 'schedule:schedule-1',
+      lastRunAt: '2026-01-15T09:00:00.000Z',
+    });
+  },
+}));
+
+mock.module('../src/session/runtime.ts', () => ({
+  createEnsureSessionRuntime() {
+    return async () => true;
+  },
+}));
+
+mock.module('../src/router.ts', () => ({
+  routeRequest() {
+    return {
+      agentGroup: {
+        id: 'support',
+        provider: 'anthropic',
+        model: 'support-model',
+        thinking: 'medium',
+        workspace: '/workspace/support',
+        permissions: '{}',
+        config: '{"provider_env_passthrough":[{"name":""}]}',
+      },
+      threadId: 'schedule:schedule-1',
+      session: {
+        id: 'session-1',
+        agent_group_id: 'support',
+        thread_id: 'schedule:schedule-1',
+        session_file: '/tmp/cove-v2-scheduler-invalid-config-' + crypto.randomUUID(),
+        metadata: null,
+        created_at: '2026-01-15T08:00:00.000Z',
+        updated_at: '2026-01-15T08:00:00.000Z',
+      },
+    };
+  },
+}));
+
+mock.module('../src/jobs/cron-scheduler.ts', () => ({
+  createScheduler() {
+    return {
+      upsertSchedule() {},
+      removeSchedule() {},
+      async start() {},
+      async stop() {},
+    };
+  },
+  getRegisteredRunAgentPrompt() {
+    return null;
+  },
+  getRegisteredRollbackWorkflow() {
+    return null;
+  },
+  getRegisteredStartWorkflow() {
+    return null;
+  },
+  getRegisteredWorkflowService() {
+    return null;
+  },
+  removeSchedule() {},
+  registerRollbackWorkflow() {},
+  registerRunAgentPrompt() {},
+  registerStartWorkflow() {},
+  registerWorkflowService() {},
+  setScheduleRuntimeSync() {},
+  upsertSchedule() {},
+}));
+
+mock.module('../src/delivery.ts', () => ({
+  DeliveryTimeoutError: class DeliveryTimeoutError extends Error {},
+  pollForResponse() {
+    return Promise.resolve([]);
+  },
+}));
+
+const { boot } = await import('../src/index.ts?scheduler-invalid-config=' + ${JSON.stringify(crypto.randomUUID())});
+
+describe('invalid-config schedule isolation', () => {
+  it('throws the shared runtime-prep validation error', async () => {
+    const db = {
+      close() {},
+    } as unknown as Database;
+
+    const runtime = await boot({
+      getDb() {
+        return db;
+      },
+      migrate() {},
+      async cleanupOrphans() {},
+      createWarmPool() {
+        return {
+          async start() {},
+          async stop() {},
+          async acquire() {
+            return null;
+          },
+          consume() {},
+          release() {},
+          getStats() {
+            return { ready: 0, allocated: 0, starting: 0 };
+          },
+        };
+      },
+      startSweep() {
+        return {
+          async stop() {},
+        };
+      },
+      startApiServer() {
+        return {
+          hostname: '127.0.0.1',
+          port: 4111,
+          async stop() {},
+        };
+      },
+    });
+
+    try {
+      await expect(createRunAgentPromptArgs.execute({
+        agent_group_id: 'support',
+        thread_id: 'schedule:schedule-1',
+        messages: [
+          { role: 'user', content: 'Run now' },
+        ],
+      })).rejects.toThrow('Invalid agent group config: provider_env_passthrough[0].name must be a non-empty string');
     } finally {
       await runtime.stop();
     }

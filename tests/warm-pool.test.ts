@@ -70,6 +70,7 @@ describe('warm pool', () => {
 
     const pool = createWarmPool({
       stateDir,
+      centralDbPath: path.join(stateDir, 'cove.db'),
       minSize: 1,
       maxSize: 1,
       spawnContainer(sessionId, _containerName, sessionDir) {
@@ -92,11 +93,14 @@ describe('warm pool', () => {
       try {
         const row = db.prepare(
           'SELECT provider, model, extra_env FROM session_config LIMIT 1',
-        ).get() as { provider: string; model: string; extra_env: string | null };
+        ).get() as { provider: string | null; model: string | null; extra_env: string | null };
 
-        expect(row.provider).toBe('auto');
-        expect(row.model).toBe(capturedSessionId!);
-        expect(JSON.parse(row.extra_env ?? '{}')).toMatchObject({ COVE_SESSION_ID: capturedSessionId! });
+        expect(row.provider).toBeNull();
+        expect(row.model).toBeNull();
+        expect(JSON.parse(row.extra_env ?? '{}')).toMatchObject({
+          COVE_SESSION_ID: capturedSessionId!,
+          COVE_CENTRAL_DB_PATH: path.join(stateDir, 'cove.db'),
+        });
       } finally {
         db.close();
       }

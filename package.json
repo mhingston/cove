@@ -1,13 +1,15 @@
 {
-  "name": "cove-v2",
-  "private": true,
+  "name": "cove",
+  "author": "Mark Hingston",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
-    "test:coverage": "bun test --coverage",
+    "test:coverage": "bun test --coverage --coverage-reporter=lcov --coverage-dir=coverage && bun run scripts/check-coverage.ts",
     "test:docker": "bun -e \"import { existsSync, readdirSync } from 'node:fs'; const hasTests = (dir) => existsSync(dir) && readdirSync(dir, { recursive: true }).some((entry) => String(entry).endsWith('.test.ts')); const args = ['bun', 'test', 'tests/container', 'tests/container-agent']; if (!hasTests('tests/container') && !hasTests('tests/container-agent')) { console.log('No Docker proof tests yet.'); process.exit(0); } const result = Bun.spawnSync(args, { stdio: ['inherit', 'inherit', 'inherit'] }); process.exit(result.exitCode); \"",
-    "bench": "bun -e \"import { existsSync, readdirSync } from 'node:fs'; const hasBenchTests = existsSync('tests/performance') && readdirSync('tests/performance', { recursive: true }).some((entry) => String(entry).endsWith('.test.ts')); const args = ['bun', 'test', 'tests/performance']; if (!hasBenchTests) { console.log('No performance benchmarks yet.'); process.exit(0); } const result = Bun.spawnSync(args, { stdio: ['inherit', 'inherit', 'inherit'] }); process.exit(result.exitCode); \""
+    "bench": "bun -e \"import { existsSync, readdirSync } from 'node:fs'; const hasBenchTests = existsSync('tests/performance') && readdirSync('tests/performance', { recursive: true }).some((entry) => String(entry).endsWith('.test.ts')); const args = ['bun', 'test', 'tests/performance']; if (!hasBenchTests) { console.log('No performance benchmarks yet.'); process.exit(0); } const result = Bun.spawnSync(args, { stdio: ['inherit', 'inherit', 'inherit'] }); process.exit(result.exitCode); \"",
+    "test:e2e:live": "bun run scripts/live-e2e-chat.ts"
   },
   "dependencies": {
     "@mariozechner/pi-coding-agent": "*",

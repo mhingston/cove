@@ -44,6 +44,18 @@ export function openOutboundDb(sessionDir: string): Database {
   return db;
 }
 
+export function openExistingOutboundDb(sessionDir: string): Database {
+  const dbPath = getOutboundDbPath(sessionDir);
+
+  if (!fs.existsSync(dbPath)) {
+    return openOutboundDb(sessionDir);
+  }
+
+  const db = new Database(dbPath);
+  db.exec('PRAGMA query_only = ON');
+  return db;
+}
+
 export function getNextOutboundSeq(lastOutSeq: number | null, inboundSeq: number): number {
   return Math.max((lastOutSeq ?? 1) + 2, inboundSeq + 1);
 }

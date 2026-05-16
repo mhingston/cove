@@ -27,8 +27,8 @@ export function openInboundDb(sessionDir: string): Database {
     );
 
     CREATE TABLE IF NOT EXISTS session_config (
-      provider       TEXT NOT NULL,
-      model          TEXT NOT NULL,
+      provider       TEXT,
+      model          TEXT,
       thinking_level TEXT,
       api_key        TEXT,
       workspace      TEXT,
@@ -49,6 +49,18 @@ export function openInboundDb(sessionDir: string): Database {
     END;
   `);
 
+  return db;
+}
+
+export function openExistingInboundDb(sessionDir: string): Database {
+  const dbPath = getInboundDbPath(sessionDir);
+
+  if (!fs.existsSync(dbPath)) {
+    return openInboundDb(sessionDir);
+  }
+
+  const db = new Database(dbPath);
+  db.exec('PRAGMA query_only = ON');
   return db;
 }
 

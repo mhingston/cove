@@ -2,11 +2,11 @@ import type { Database } from 'bun:sqlite';
 
 import { appendWorkingMessage, buildWorkingContext, ensureWorkingSession } from '../../context/working.ts';
 import { DeliveryTimeoutError, pollForResponse } from '../../delivery.ts';
-import { resolveRuntimeMcpConfig, serializeRuntimeMcpConfig } from '../../integrations/mcp.ts';
 import { routeRequest } from '../../router.ts';
+import { buildAgentGroupSessionConfig } from '../../session-config.ts';
 import { streamDirectSessionTokens } from '../../session/direct-stream.ts';
 import { openInboundDb, writeInboundMessage } from '../../session/inbound.ts';
-import { openOutboundDb } from '../../session/outbound.ts';
+import { openExistingOutboundDb } from '../../session/outbound.ts';
 import type { AppContext, ChatMessage, ChatRoutingBody, SessionConfig } from '../../shared/types.ts';
 
 type ChatRequestBody = ChatRoutingBody & {
@@ -25,6 +25,48 @@ function isChatMessageArray(value: unknown): value is ChatMessage[] {
 
 function parseRequestBody(request: Request): Promise<ChatRequestBody> {
   return request.json() as Promise<ChatRequestBody>;
+}
+
+function normalizeText(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim();
+  return normalized === '' ? null : normalized;
+}
+
+function getExplicitModelOverride(body: ChatRequestBody): string | null {
+  return normalizeText(body.provider_model) ?? normalizeText(body.model);
+}
+
+function getProviderFromQualifiedModel(model: string | null): string | null {
+  if (model == null) {
+    return null;
+  }
+
+  const separatorIndex = model.indexOf('/');
+
+  if (separatorIndex <= 0 || separatorIndex === model.length - 1) {
+    return null;
+  }
+
+  return model.slice(0, separatorIndex);
+}
+
+function getCanonicalResolvedModel(config: SessionConfig): string {
+  const model = normalizeText(config.model);
+
+  if (model == null) {
+    return '';
+  }
+
+  if (getProviderFromQualifiedModel(model) != null) {
+    return model;
+  }
+
+  const provider = normalizeText(config.provider);
+  return provider == null || provider === 'auto' ? model : `${provider}/${model}`;
 }
 
 function writeSessionConfig(db: Database, config: SessionConfig): void {
@@ -94,57 +136,25 @@ function materializeTranscriptContext(sessionDir: string, sessionId: string, mes
   }
 }
 
-function parseAgentGroupConfig(configValue: string | null): {
-  api_key?: string;
-  credential_profile?: string;
-  extra_env?: Record<string, string>;
-} | null {
-  if (typeof configValue !== 'string' || configValue.trim() === '') {
-    return null;
-  }
-
-  try {
-    return JSON.parse(configValue) as {
-      api_key?: string;
-      credential_profile?: string;
-      extra_env?: Record<string, string>;
-    };
-  } catch {
-    return null;
-  }
-}
-
 function buildSessionConfig(routed: ReturnType<typeof routeRequest>, requestBody: ChatRequestBody): SessionConfig {
-  const parsedConfig = parseAgentGroupConfig(routed.agentGroup.config);
-  const hasOneCliGatewayEnv = (process.env.ONECLI_AGENT_NAME?.trim() ?? '') !== ''
-    && (process.env.ONECLI_URL?.trim() ?? '') !== '';
-  const oneCliAuthEnabled = (() => {
-    const rawValue = parsedConfig?.extra_env?.COVE_ONECLI_AUTH ?? process.env.COVE_ONECLI_AUTH;
-
-    if (rawValue == null) {
-      return true;
-    }
-
-    const normalized = rawValue.trim().toLowerCase();
-    return normalized !== '0' && normalized !== 'false' && normalized !== 'off' && normalized !== 'disabled';
-  })();
-  const mcpConfig = serializeRuntimeMcpConfig(resolveRuntimeMcpConfig(parsedConfig ?? undefined)) ?? null;
+  const base = buildAgentGroupSessionConfig(routed.agentGroup);
+  const explicitModelOverride = getExplicitModelOverride(requestBody);
+  const explicitProvider = getProviderFromQualifiedModel(explicitModelOverride);
+  const centralDbPath = typeof process.env.COVE_STATE_DIR === 'string' && process.env.COVE_STATE_DIR.trim() !== ''
+    ? `${process.env.COVE_STATE_DIR}/cove.db`
+    : null;
   const extraEnv = {
-    ...(parsedConfig?.extra_env ?? {}),
-    ...(parsedConfig?.credential_profile == null ? {} : { credential_profile: parsedConfig.credential_profile }),
-    ...(mcpConfig == null ? {} : { COVE_MCP_CONFIG: mcpConfig }),
+    ...(base.extra_env ?? {}),
+    COVE_SESSION_ID: routed.session.id,
+    COVE_AGENT_GROUP_ID: routed.agentGroup.id,
+    ...(centralDbPath == null ? {} : { COVE_CENTRAL_DB_PATH: centralDbPath }),
   };
 
   return {
-    provider: routed.agentGroup.provider,
-    model: typeof requestBody.provider_model === 'string' && requestBody.provider_model.trim() !== ''
-      ? requestBody.provider_model.trim()
-      : routed.agentGroup.model || routed.agentGroup.id,
-    thinking_level: routed.agentGroup.thinking,
-    api_key: oneCliAuthEnabled && hasOneCliGatewayEnv ? null : parsedConfig?.api_key ?? null,
-    workspace: routed.agentGroup.workspace,
+    ...base,
+    provider: explicitProvider ?? base.provider,
+    model: explicitModelOverride ?? base.model,
     extra_env: Object.keys(extraEnv).length > 0 ? extraEnv : null,
-    permissions: routed.agentGroup.permissions,
   };
 }
 
@@ -268,14 +278,24 @@ export async function handleChatCompletion(request: Request, context: AppContext
     });
   } catch (error) {
     if (error instanceof Error && /Agent group .* not found/.test(error.message)) {
-      const missingAgentGroupId = body.agent_group_id?.trim() || request.headers.get('X-Agent-Group-Id')?.trim() || body.model?.trim() || 'default';
+      const missingAgentGroupId = body.agent_group_id?.trim() || request.headers.get('X-Agent-Group-Id')?.trim() || 'default';
       return jsonError(`Agent group not found: ${missingAgentGroupId}`, 404);
     }
 
     throw error;
   }
 
-  const sessionConfig = buildSessionConfig(routed, body);
+  let sessionConfig: SessionConfig;
+
+  try {
+    sessionConfig = buildSessionConfig(routed, body);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Invalid agent group config:')) {
+      return jsonError(error.message, 400);
+    }
+
+    throw error;
+  }
 
   if (ensureSessionRuntime != null) {
     const ready = await ensureSessionRuntime({ routed, config: sessionConfig });
@@ -299,7 +319,7 @@ export async function handleChatCompletion(request: Request, context: AppContext
     return jsonError('Session runtime is unavailable', 503);
   }
 
-  const outboundBaselineDb = openOutboundDb(sessionDir);
+  const outboundBaselineDb = openExistingOutboundDb(sessionDir);
   let baselineSeq = 0;
 
   try {
@@ -321,18 +341,16 @@ export async function handleChatCompletion(request: Request, context: AppContext
     inboundDb.close();
   }
 
-  const outboundDb = openOutboundDb(sessionDir);
-
   try {
     const messages = await pollForResponseImpl({
-      db: outboundDb,
+      openDb: () => openExistingOutboundDb(sessionDir),
       sessionId: routed.session.id,
       baselineOutSeq: baselineSeq,
     });
 
     return buildOpenAiResponse({
       sessionId: routed.session.id,
-      model: routed.agentGroup.id,
+      model: getCanonicalResolvedModel(sessionConfig),
       messages,
     });
   } catch (error) {
@@ -341,7 +359,5 @@ export async function handleChatCompletion(request: Request, context: AppContext
     }
 
     throw error;
-  } finally {
-    outboundDb.close();
   }
 }

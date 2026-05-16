@@ -50,7 +50,7 @@ describe('API server', () => {
     });
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, phase: 'Phase 5' });
+    expect(await response.json()).toEqual({ ok: true });
   });
 
   it('returns the plan-aligned health payload from GET /healthz', async () => {
@@ -65,7 +65,7 @@ describe('API server', () => {
       const response = await fetch(`http://${server.hostname}:${server.port}/healthz`);
 
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ ok: true, phase: 'Phase 5' });
+      expect(await response.json()).toEqual({ ok: true });
     } finally {
       await server.stop();
       db.close();

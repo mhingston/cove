@@ -172,6 +172,12 @@ describe('agent groups api', () => {
           extra_env: {
             FOO: 'bar',
           },
+          provider_env_passthrough: [
+            { name: 'CUSTOM_TOKEN', required: true },
+          ],
+          provider_file_env_passthrough: [
+            { name: 'CUSTOM_CRED_FILE', kind: 'file', required: true },
+          ],
         },
       }),
     }));
@@ -195,9 +201,55 @@ describe('agent groups api', () => {
         extra_env: {
           FOO: 'bar',
         },
+        provider_env_passthrough: [
+          { name: 'CUSTOM_TOKEN', required: true },
+        ],
+        provider_file_env_passthrough: [
+          { name: 'CUSTOM_CRED_FILE', kind: 'file', required: true },
+        ],
       },
       created_at: expect.any(String),
       updated_at: expect.any(String),
+    });
+  });
+
+  it('rejects invalid runtime-prep config on create and update', async () => {
+    db = createAgentGroupDb();
+    insertAgentGroup(requireDb(), 'support');
+
+    const app = createApp({ db: requireDb() });
+
+    const invalidCreateResponse = await app.fetch(new Request('http://cove.test/v1/agent-groups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: 'invalid-create',
+        name: 'Invalid Create',
+        config: {
+          provider_env_passthrough: [{ name: '   ' }],
+        },
+      }),
+    }));
+    expect(invalidCreateResponse.status).toBe(400);
+    expect(await json<{ error: string }>(invalidCreateResponse)).toEqual({
+      error: 'Invalid agent group config: provider_env_passthrough[0].name must be a non-empty string',
+    });
+
+    const invalidUpdateResponse = await app.fetch(new Request('http://cove.test/v1/agent-groups/support', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        config: {
+          extra_env: {
+            CUSTOM_CRED_FILE: 'literal-path',
+          },
+          provider_file_env_passthrough: [{ name: 'CUSTOM_CRED_FILE', kind: 'file' }],
+        },
+      }),
+    }));
+    expect(invalidUpdateResponse.status).toBe(400);
+    expect(await json<{ error: string }>(invalidUpdateResponse)).toEqual({
+      error: 'Invalid agent group config: extra_env must not define provider file passthrough name: CUSTOM_CRED_FILE',
     });
   });
 

@@ -12,7 +12,7 @@ import { assembleContext } from '../context/assembly.ts';
 import { loadPersona } from '../context/persona.ts';
 import { parseRuntimeMcpConfig } from '../integrations/mcp.ts';
 import type { ChatMessage, SessionConfig } from '../shared/types.ts';
-import { openInboundDb } from '../session/inbound.ts';
+import { openExistingInboundDb } from '../session/inbound.ts';
 import {
   getNextOutboundSeq,
   openOutboundDb,
@@ -84,6 +84,13 @@ type RunnerResourceLoader = {
 type RunnerSession = {
   subscribe(handler: (event: SessionMessageUpdate) => void): () => void;
   prompt(message: string): Promise<void>;
+  getLastAssistantText?(): string | undefined;
+  waitForIdle?(): Promise<void>;
+};
+
+type MaterializedRunnerResourceLoader = RunnerResourceLoader & {
+  reload(): Promise<void>;
+  getExtensions(): unknown;
 };
 
 type RunnerSessionResult = {
@@ -142,6 +149,7 @@ type CreateSessionOptions = {
   sessionStateDir?: string;
   resourceLoader?: RunnerResourceLoader;
   customTools?: ToolDefinition[];
+  resolveInstalledPackageDir?: (packageName: string) => string | undefined;
 };
 
 type RunnerGatewayAuthState = {
@@ -288,7 +296,7 @@ function getConfiguredSessionId(config: SessionConfig): string | undefined {
 }
 
 function getCentralDbPath(config: SessionConfig): string | undefined {
-  return config.extra_env?.COVE_CENTRAL_DB_PATH ?? process.env.COVE_CENTRAL_DB_PATH;
+  return process.env.COVE_CENTRAL_DB_PATH ?? config.extra_env?.COVE_CENTRAL_DB_PATH;
 }
 
 function getAgentGroupId(config: SessionConfig): string | undefined {
@@ -373,7 +381,30 @@ function getRunnerApiKey(config: SessionConfig): string | null {
   return apiKey == null || apiKey === '' ? null : apiKey;
 }
 
+function hasInheritedProviderEnvAuth(config: SessionConfig, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (config.provider == null || config.model == null) {
+    return false;
+  }
+
+  const resolvedModel = resolveContainerAgentModel({
+    provider: config.provider,
+    model: config.model,
+  });
+
+  if (resolvedModel.provider !== 'github-copilot') {
+    return false;
+  }
+
+  return [env.COPILOT_GITHUB_TOKEN, env.GH_TOKEN, env.GITHUB_TOKEN].some(
+    (value) => value != null && value.trim() !== '',
+  );
+}
+
 function validateRunnerCredentials(config: SessionConfig): void {
+  if (config.provider == null || config.model == null) {
+    throw new Error('Container agent startup requires a resolved provider and model before credential validation.');
+  }
+
   const gateway = getGatewayAuthState(config);
 
   if (gateway.isEnabled && gateway.isSupported && gateway.hasInheritedGatewayEnv) {
@@ -384,6 +415,10 @@ function validateRunnerCredentials(config: SessionConfig): void {
     return;
   }
 
+  if (hasInheritedProviderEnvAuth(config)) {
+    return;
+  }
+
   const resolvedModel = resolveContainerAgentModel({
     provider: config.provider,
     model: config.model,
@@ -391,28 +426,70 @@ function validateRunnerCredentials(config: SessionConfig): void {
   throw new Error(`Container agent startup requires inherited OneCLI gateway auth or API_KEY for ${resolvedModel.id}.`);
 }
 
-function prepareMcpAgentDir(config: SessionConfig, sessionStateDir: string, resolvePackageDir: (packageName: string) => string | undefined): {
+function prepareSessionOverlayAgentDir(config: SessionConfig, sessionStateDir: string, resolvePackageDir: (packageName: string) => string | undefined): {
   agentDir: string;
-  packageDir: string;
-} | undefined {
+  packageDir?: string;
+} {
+  const agentDir = path.join(sessionStateDir, '.pi-agent');
+  const mcpConfigPath = path.join(agentDir, 'mcp.json');
   const rawConfig = config.extra_env?.COVE_MCP_CONFIG ?? process.env.COVE_MCP_CONFIG;
   const mcpConfig = parseRuntimeMcpConfig(rawConfig);
 
+  fs.mkdirSync(agentDir, { recursive: true });
+
   if (mcpConfig == null) {
-    return undefined;
+    fs.rmSync(mcpConfigPath, { force: true });
+    return { agentDir };
   }
 
   const packageDir = resolvePackageDir('pi-mcp-adapter');
 
-  if (packageDir == null) {
-    return undefined;
-  }
-
-  const agentDir = path.join(sessionStateDir, '.pi-agent');
-  fs.mkdirSync(agentDir, { recursive: true });
-  fs.writeFileSync(path.join(agentDir, 'mcp.json'), JSON.stringify(mcpConfig, null, 2), 'utf8');
+  fs.writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2), 'utf8');
 
   return { agentDir, packageDir };
+}
+
+function resolvePiSessionDir(sessionStateDir: string): string {
+  return path.join(sessionStateDir, '.pi-agent', 'sessions');
+}
+
+function normalizePathForComparison(candidate: string): string {
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
+function isPathWithinRoot(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function validateMaterializedExtensions(extensions: unknown, allowedRoots: string[]): void {
+  if (!Array.isArray(extensions) || extensions.length === 0) {
+    return;
+  }
+
+  const normalizedRoots = allowedRoots.map((root) => normalizePathForComparison(root));
+
+  for (const extension of extensions) {
+    const rawSourcePath = extension != null && typeof extension === 'object' && !Array.isArray(extension)
+      ? (extension as { sourcePath?: unknown }).sourcePath
+      : undefined;
+
+    if (typeof rawSourcePath !== 'string' || rawSourcePath.trim() === '') {
+      throw new Error('Unsupported inherited extension: unknown source. Inherited tool registration could not be classified.');
+    }
+
+    const sourcePath = normalizePathForComparison(rawSourcePath);
+
+    if (normalizedRoots.some((root) => isPathWithinRoot(sourcePath, root))) {
+      continue;
+    }
+
+    throw new Error(`Unsupported inherited extension: ${rawSourcePath}. This inherited tool registration is not supported for this redesign release.`);
+  }
 }
 
 function resolveCustomTools(
@@ -503,6 +580,20 @@ function blockedToolResultText(result: BlockedToolResult | undefined): string | 
   return result.permission === 'confirm' ? result.message : result.question;
 }
 
+function resolveSessionResponseText(session: RunnerSessionResult['session'], tokens: string[]): string {
+  const streamedText = tokens.join('');
+
+  if (streamedText !== '') {
+    return streamedText;
+  }
+
+  if (typeof session.getLastAssistantText === 'function') {
+    return session.getLastAssistantText() ?? '';
+  }
+
+  return '';
+}
+
 function createAssistantToolCall(toolName: string, args: Record<string, unknown>): AssistantMessage {
   return {
     role: 'assistant',
@@ -577,8 +668,11 @@ function isMaterializedResourceLoader(value: unknown): value is {
     && typeof (value as { reload?: unknown }).reload === 'function';
 }
 
-async function materializeResourceLoader(options: RunnerResourceLoader): Promise<RunnerResourceLoader> {
-  const packageDir = resolveInstalledPackageDir('@mariozechner/pi-coding-agent');
+async function materializeResourceLoader(
+  options: RunnerResourceLoader,
+  resolvePackageDir: (packageName: string) => string | undefined = resolveInstalledPackageDir,
+): Promise<RunnerResourceLoader> {
+  const packageDir = resolvePackageDir('@mariozechner/pi-coding-agent');
 
   if (packageDir == null) {
     throw new Error('Could not locate @mariozechner/pi-coding-agent installation');
@@ -588,15 +682,18 @@ async function materializeResourceLoader(options: RunnerResourceLoader): Promise
     getAgentDir(): string;
   };
   const module = await import(pathToFileURL(path.join(packageDir, 'dist', 'core', 'resource-loader.js')).href) as unknown as {
-    DefaultResourceLoader: new (loaderOptions: RunnerResourceLoader) => RunnerResourceLoader & {
-      reload(): Promise<void>;
-    };
+    DefaultResourceLoader: new (loaderOptions: RunnerResourceLoader) => MaterializedRunnerResourceLoader;
   };
   const loader = new module.DefaultResourceLoader({
     ...options,
     agentDir: options.agentDir ?? configModule.getAgentDir(),
   });
   await loader.reload();
+  validateMaterializedExtensions(loader.getExtensions(), [
+    options.agentDir ?? configModule.getAgentDir(),
+    packageDir,
+    ...(options.additionalExtensionPaths ?? []),
+  ]);
   return loader;
 }
 
@@ -625,7 +722,10 @@ export async function prepareHostSession(options: {
   const deps = options.deps ?? defaultDeps;
   const createSession = deps.createSession ?? defaultDeps.createSession;
   const createCustomTools = deps.createCoveTools ?? defaultDeps.createCoveTools;
-  const resolvePackageDir = deps.resolveInstalledPackageDir ?? defaultDeps.resolveInstalledPackageDir;
+  const resolvePackageDir = (packageName: string): string | undefined => {
+    return deps.resolveInstalledPackageDir?.(packageName)
+      ?? defaultDeps.resolveInstalledPackageDir(packageName);
+  };
   let blockedToolResult: BlockedToolResult | undefined;
   const resourceLoader = buildResourceLoader({
     config: options.config,
@@ -649,6 +749,7 @@ export async function prepareHostSession(options: {
     sessionStateDir: options.sessionStateDir,
     resourceLoader,
     customTools,
+    resolveInstalledPackageDir: resolvePackageDir,
   });
 
   if (blockedToolResult != null) {
@@ -895,6 +996,11 @@ async function createDefaultSession(options: CreateSessionOptions): Promise<Runn
   const gatewayAuth = getGatewayAuthState(options.config);
 
   validateRunnerCredentials(options.config);
+
+  if (options.config.provider == null || options.config.model == null) {
+    throw new Error('Container agent startup requires a resolved provider and model.');
+  }
+
   const setup = await setupContainerAgent({
     provider: options.config.provider,
     model: options.config.model,
@@ -928,7 +1034,7 @@ async function createDefaultSession(options: CreateSessionOptions): Promise<Runn
     async createSessionManager(input) {
       const cwd = options.config.workspace ?? process.cwd();
       return input.mode === 'continueRecent'
-        ? sdk.SessionManager.continueRecent(cwd, input.sessionStateDir)
+        ? sdk.SessionManager.continueRecent(cwd, input.sessionStateDir == null ? undefined : resolvePiSessionDir(input.sessionStateDir))
         : sdk.SessionManager.inMemory(cwd);
     },
     async createSession(input) {
@@ -942,7 +1048,7 @@ async function createDefaultSession(options: CreateSessionOptions): Promise<Runn
 
       const resourceLoader = options.resourceLoader == null || isMaterializedResourceLoader(options.resourceLoader)
         ? options.resourceLoader
-        : await materializeResourceLoader(options.resourceLoader);
+        : await materializeResourceLoader(options.resourceLoader, options.resolveInstalledPackageDir ?? resolveInstalledPackageDir);
 
       return sdk.createAgentSession({
         authStorage: input.auth,
@@ -978,13 +1084,13 @@ function buildResourceLoader(options: {
   const bridge = new PermissionBridgeImpl({ policy });
   const centralDbPath = getCentralDbPath(options.config);
   const agentGroupId = getAgentGroupId(options.config);
-  const mcpAgentDir = prepareMcpAgentDir(options.config, options.sessionStateDir, options.resolveInstalledPackageDir);
+  const sessionOverlayAgentDir = prepareSessionOverlayAgentDir(options.config, options.sessionStateDir, options.resolveInstalledPackageDir);
   const subagentPackageDir = agentGroupId == null ? undefined : options.resolveInstalledPackageDir('pi-subagents');
   const gatewayAuth = getGatewayAuthState(options.config);
   const oneCliExtensionPackageDir = gatewayAuth.isEnabled && gatewayAuth.isSupported && gatewayAuth.hasInheritedGatewayEnv
     ? options.resolveInstalledPackageDir('pi-onecli-extension')
     : undefined;
-  const additionalExtensionPaths = [subagentPackageDir, mcpAgentDir?.packageDir, oneCliExtensionPackageDir]
+  const additionalExtensionPaths = [subagentPackageDir, sessionOverlayAgentDir.packageDir, oneCliExtensionPackageDir]
     .filter((value): value is string => value != null);
   const persona = agentGroupId == null || centralDbPath == null
     ? undefined
@@ -995,13 +1101,8 @@ function buildResourceLoader(options: {
 
   return {
     cwd: options.config.workspace ?? process.cwd(),
-    agentDir: mcpAgentDir?.agentDir,
+    agentDir: sessionOverlayAgentDir.agentDir,
     additionalExtensionPaths,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
     extensionFactories: [
       (runtime) => {
         runtime.on('before_agent_start', async (event) => {
@@ -1119,6 +1220,26 @@ function resolveSessionId(options: RunContainerSessionOptions, effectiveConfig: 
     ?? path.basename(path.dirname(options.inboundPath));
 }
 
+function openRunnerOutboundDb(sessionDir: string): Database {
+  try {
+    return openOutboundDb(sessionDir);
+  } catch (error) {
+    const dbPath = path.join(sessionDir, 'outbound.db');
+    const sessionDirExists = fs.existsSync(sessionDir);
+    const outboundPathExists = fs.existsSync(dbPath);
+    const sessionDirEntries = sessionDirExists
+      ? fs.readdirSync(sessionDir).sort().join(',')
+      : '<missing>';
+    const details = `Failed to open outbound DB at ${dbPath} (sessionDirExists=${sessionDirExists}, outboundPathExists=${outboundPathExists}, sessionDirEntries=${sessionDirEntries})`;
+
+    if (error instanceof Error) {
+      error.message = `${error.message}. ${details}`;
+    }
+
+    throw error;
+  }
+}
+
 export function resolveSessionDbPaths(): { inboundPath: string; outboundPath: string } {
   const sessionDir = process.env.COVE_SESSION_DIR ?? '/app/session';
 
@@ -1134,21 +1255,17 @@ export async function runContainerSession(
   deps: ContainerSessionDeps = defaultDeps,
   onToken?: (token: string) => void,
 ): Promise<string> {
-  const inboundDb = openInboundDb(path.dirname(options.inboundPath));
-  const outboundDb = openOutboundDb(path.dirname(options.outboundPath));
+  const inboundDb = openExistingInboundDb(path.dirname(options.inboundPath));
+  const outboundSessionDir = path.dirname(options.outboundPath);
+  const initialOutboundDb = openRunnerOutboundDb(outboundSessionDir);
   const sessionStateDir = path.dirname(options.inboundPath);
 
   try {
     const persistedConfig = readSessionConfig(inboundDb);
     const effectiveConfig = mergeSessionConfig(options.config, persistedConfig);
     const sessionId = resolveSessionId(options, effectiveConfig);
-    const derivedPathSessionId = path.basename(path.dirname(options.inboundPath));
 
-    if (sessionId !== derivedPathSessionId) {
-      outboundDb.prepare('DELETE FROM processing_ack WHERE session_id != ?').run(sessionId);
-    }
-
-    const ack = readProcessingAck(outboundDb, sessionId);
+    const ack = readProcessingAck(initialOutboundDb, sessionId);
     let lastProcessed = ack?.last_in_seq ?? 0;
     let lastOutSeq = ack?.last_out_seq ?? 0;
     const messages = inboundDb.prepare(
@@ -1158,19 +1275,31 @@ export async function runContainerSession(
        ORDER BY seq ASC`,
     ).all(lastProcessed) as InboundRow[];
 
+    initialOutboundDb.close();
+
     if (messages.length === 0) {
-      writeProcessingAck(outboundDb, {
-        session_id: sessionId,
-        last_in_seq: ack?.last_in_seq ?? null,
-        last_out_seq: ack?.last_out_seq ?? null,
-        heartbeat_at: new Date().toISOString(),
-      });
+      const outboundDb = openRunnerOutboundDb(outboundSessionDir);
+
+      try {
+        writeProcessingAck(outboundDb, {
+          session_id: sessionId,
+          last_in_seq: ack?.last_in_seq ?? null,
+          last_out_seq: ack?.last_out_seq ?? null,
+          heartbeat_at: new Date().toISOString(),
+        });
+      } finally {
+        outboundDb.close();
+      }
+
       return '';
     }
 
     const createSession = deps.createSession ?? defaultDeps.createSession;
     const createCustomTools = deps.createCoveTools ?? defaultDeps.createCoveTools;
-    const resolvePackageDir = deps.resolveInstalledPackageDir ?? defaultDeps.resolveInstalledPackageDir;
+    const resolvePackageDir = (packageName: string): string | undefined => {
+      return deps.resolveInstalledPackageDir?.(packageName)
+        ?? defaultDeps.resolveInstalledPackageDir(packageName);
+    };
     let lastResponse = '';
 
     for (const message of messages) {
@@ -1197,6 +1326,7 @@ export async function runContainerSession(
           sessionStateDir,
           resourceLoader,
           customTools,
+          resolveInstalledPackageDir: resolvePackageDir,
         })
       ).session;
 
@@ -1207,6 +1337,9 @@ export async function runContainerSession(
           onToken?.(event.assistantMessageEvent.delta);
         }
       });
+      const promptStartedAt = Date.now();
+
+      console.error(`[runner] prompt-start session=${sessionId} seq=${message.seq}`);
 
       try {
         await currentSession.prompt(message.content);
@@ -1214,7 +1347,9 @@ export async function runContainerSession(
         unsubscribe();
       }
 
-      const response = blockedToolResultText(blockedToolResult) ?? tokens.join('');
+      console.error(`[runner] prompt-end session=${sessionId} seq=${message.seq} elapsedMs=${Date.now() - promptStartedAt} tokenChars=${tokens.join('').length}`);
+
+      const response = blockedToolResultText(blockedToolResult) ?? resolveSessionResponseText(currentSession, tokens);
       lastResponse = response;
       const seq = getNextOutboundSeq(lastOutSeq, message.seq);
       const outboundMetadata = approvalResume != null && blockedToolResult == null
@@ -1226,23 +1361,31 @@ export async function runContainerSession(
           }
         : blockedToolResult;
 
-      writeOutboundMessage(outboundDb, {
-        id: crypto.randomUUID(),
-        seq,
-        role: 'assistant',
-        content: response,
-        metadata: outboundMetadata,
-      });
+      const outboundDb = openRunnerOutboundDb(outboundSessionDir);
 
-      lastProcessed = message.seq;
-      lastOutSeq = seq;
+      try {
+        writeOutboundMessage(outboundDb, {
+          id: crypto.randomUUID(),
+          seq,
+          role: 'assistant',
+          content: response,
+          metadata: outboundMetadata,
+        });
 
-      writeProcessingAck(outboundDb, {
-        session_id: sessionId,
-        last_in_seq: lastProcessed,
-        last_out_seq: lastOutSeq,
-        heartbeat_at: new Date().toISOString(),
-      });
+        lastProcessed = message.seq;
+        lastOutSeq = seq;
+
+        writeProcessingAck(outboundDb, {
+          session_id: sessionId,
+          last_in_seq: lastProcessed,
+          last_out_seq: lastOutSeq,
+          heartbeat_at: new Date().toISOString(),
+        });
+
+        console.error(`[runner] outbound-write session=${sessionId} seq=${seq}`);
+      } finally {
+        outboundDb.close();
+      }
 
       onResponse?.(response);
     }
@@ -1250,7 +1393,6 @@ export async function runContainerSession(
     return lastResponse;
   } finally {
     inboundDb.close();
-    outboundDb.close();
   }
 }
 

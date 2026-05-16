@@ -4,7 +4,7 @@ import path from 'node:path';
 import { startApiServer } from './api/server.ts';
 import { cleanupOrphans as cleanupOrphanContainers } from './container/detect.ts';
 import { getImageName } from './container/image.ts';
-import { spawnContainer } from './container/spawn.ts';
+import { getActiveContainers, killContainer, spawnContainer } from './container/spawn.ts';
 import { getDb } from './db/index.ts';
 import { getStateDir } from './db/index.ts';
 import { migrate } from './db/migrate.ts';
@@ -23,8 +23,9 @@ import { createRunAgentPrompt, type RunAgentPromptExecutionResult } from './jobs
 import { routeRequest } from './router.ts';
 import { pollForResponse } from './delivery.ts';
 import { openInboundDb, writeInboundMessage } from './session/inbound.ts';
-import { openOutboundDb } from './session/outbound.ts';
+import { openExistingOutboundDb } from './session/outbound.ts';
 import { createEnsureSessionRuntime } from './session/runtime.ts';
+import { buildAgentGroupSessionConfig } from './session-config.ts';
 import { createWorkflowRuntime as createDefaultWorkflowRuntime, type WorkflowRuntime } from './workflows/runtime.ts';
 import { createWorkflowSessionBindings } from './workflows/session-bindings.ts';
 import type { ApiServer, Scheduler, SweepHandle, WarmPool } from './shared/types.ts';
@@ -42,6 +43,7 @@ export type BootDependencies = {
   getDb(): Database;
   migrate(db: Database): void;
   cleanupOrphans(): Promise<void>;
+  stopTrackedContainers(): void;
   createWarmPool(db: Database): WarmPool;
   createWorkflowRuntime(databasePath: string): WorkflowRuntime;
   createScheduler(db: Database): Scheduler;
@@ -70,6 +72,12 @@ async function cleanupOrphans(): Promise<void> {
   cleanupOrphanContainers();
 }
 
+function stopTrackedContainers(): void {
+  for (const sessionId of [...getActiveContainers().keys()]) {
+    killContainer(sessionId, 'runtime shutdown');
+  }
+}
+
 function readPoolSize(name: 'COVE_POOL_MIN' | 'COVE_POOL_MAX', fallback: number): number {
   const value = process.env[name]?.trim();
 
@@ -84,11 +92,13 @@ function readPoolSize(name: 'COVE_POOL_MIN' | 'COVE_POOL_MAX', fallback: number)
 function createWarmPool(_db: Database): WarmPool {
   const stateDir = getStateDir();
   const imageName = getImageName();
+  const centralDbPath = path.join(stateDir, 'cove.db');
 
   return createDefaultWarmPool({
     stateDir,
     minSize: readPoolSize('COVE_POOL_MIN', 1),
     maxSize: readPoolSize('COVE_POOL_MAX', 5),
+    centralDbPath,
     imageName,
     spawnContainer(sessionId, containerName, sessionDir, warmImageName) {
       return spawnContainer({
@@ -96,6 +106,7 @@ function createWarmPool(_db: Database): WarmPool {
         containerName,
         sessionId,
         sessionDir,
+        centralDbPath,
       });
     },
   });
@@ -109,28 +120,7 @@ function createWorkflowRuntime(databasePath: string): WorkflowRuntime {
   return createDefaultWorkflowRuntime(databasePath);
 }
 
-function parseAgentGroupConfig(configValue: string | null): {
-  api_key?: string;
-  credential_profile?: string;
-  extra_env?: Record<string, string>;
-} | null {
-  if (typeof configValue !== 'string' || configValue.trim() === '') {
-    return null;
-  }
-
-  try {
-    return JSON.parse(configValue) as {
-      api_key?: string;
-      credential_profile?: string;
-      extra_env?: Record<string, string>;
-    };
-  } catch {
-    return null;
-  }
-}
-
 function buildScheduledSessionConfig(agentGroup: {
-  id: string;
   provider: string;
   model: string | null;
   thinking: string;
@@ -138,35 +128,7 @@ function buildScheduledSessionConfig(agentGroup: {
   permissions: string;
   config: string | null;
 }): SessionConfig {
-  const parsedConfig = parseAgentGroupConfig(agentGroup.config);
-  const hasOneCliGatewayEnv = (process.env.ONECLI_AGENT_NAME?.trim() ?? '') !== ''
-    && (process.env.ONECLI_URL?.trim() ?? '') !== '';
-  const oneCliAuthEnabled = (() => {
-    const rawValue = parsedConfig?.extra_env?.COVE_ONECLI_AUTH ?? process.env.COVE_ONECLI_AUTH;
-
-    if (rawValue == null) {
-      return true;
-    }
-
-    const normalized = rawValue.trim().toLowerCase();
-    return normalized !== '0' && normalized !== 'false' && normalized !== 'off' && normalized !== 'disabled';
-  })();
-  const mcpConfig = serializeRuntimeMcpConfig(resolveRuntimeMcpConfig(parsedConfig ?? undefined)) ?? null;
-  const extraEnv = {
-    ...(parsedConfig?.extra_env ?? {}),
-    ...(parsedConfig?.credential_profile == null ? {} : { credential_profile: parsedConfig.credential_profile }),
-    ...(mcpConfig == null ? {} : { COVE_MCP_CONFIG: mcpConfig }),
-  };
-
-  return {
-    provider: agentGroup.provider,
-    model: agentGroup.model || agentGroup.id,
-    thinking_level: agentGroup.thinking,
-    api_key: oneCliAuthEnabled && hasOneCliGatewayEnv ? null : parsedConfig?.api_key ?? null,
-    workspace: agentGroup.workspace,
-    extra_env: Object.keys(extraEnv).length > 0 ? extraEnv : null,
-    permissions: agentGroup.permissions,
-  };
+  return buildAgentGroupSessionConfig(agentGroup);
 }
 
 function writeSessionConfig(db: Database, config: SessionConfig): void {
@@ -242,7 +204,7 @@ function createBootRunAgentPrompt(options: {
         throw new Error('Session runtime is unavailable');
       }
 
-      const outboundBaselineDb = openOutboundDb(sessionDir);
+      const outboundBaselineDb = openExistingOutboundDb(sessionDir);
       let baselineSeq = 0;
 
       try {
@@ -263,23 +225,17 @@ function createBootRunAgentPrompt(options: {
         inboundDb.close();
       }
 
-      const outboundDb = openOutboundDb(sessionDir);
+      const messages = await pollForResponse({
+        openDb: () => openExistingOutboundDb(sessionDir),
+        sessionId: routed.session.id,
+        baselineOutSeq: baselineSeq,
+      });
 
-      try {
-        const messages = await pollForResponse({
-          db: outboundDb,
-          sessionId: routed.session.id,
-          baselineOutSeq: baselineSeq,
-        });
-
-        return {
-          content: messages.map((message) => message.content).join(''),
-          sessionId: routed.session.id,
-          lastRunAt: new Date().toISOString(),
-        };
-      } finally {
-        outboundDb.close();
-      }
+      return {
+        content: messages.map((message) => message.content).join(''),
+        sessionId: routed.session.id,
+        lastRunAt: new Date().toISOString(),
+      };
     },
   });
 }
@@ -317,6 +273,7 @@ const defaultDependencies: BootDependencies = {
   getDb,
   migrate,
   cleanupOrphans,
+  stopTrackedContainers,
   createWarmPool,
   createWorkflowRuntime,
   createScheduler,
@@ -354,6 +311,7 @@ export async function boot(overrides: Partial<BootDependencies> = {}): Promise<B
 
     const warmPool = dependencies.createWarmPool(db);
     cleanupActions.unshift(() => warmPool.stop());
+    cleanupActions.unshift(() => dependencies.stopTrackedContainers());
     await warmPool.start();
 
     const ensureSessionRuntime = createEnsureSessionRuntime({

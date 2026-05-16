@@ -299,6 +299,7 @@ describe('streamDirectSessionTokens', () => {
       expect(readPersistedExtraEnv(routing.session.session_file!)).toEqual({
         EXTRA_FLAG: 'kept',
         COVE_PERSONA: 'db persona',
+        COVE_SESSION_ID: 'sess-stream-1',
         COVE_AGENT_GROUP_ID: 'stream-group',
         COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
       });
@@ -359,6 +360,7 @@ describe('streamDirectSessionTokens', () => {
       expect(readPersistedExtraEnv(routing.session.session_file!)).toEqual({
         EXTRA_FLAG: 'kept',
         COVE_PERSONA: 'explicit persona',
+        COVE_SESSION_ID: 'sess-stream-explicit-persona',
         COVE_AGENT_GROUP_ID: 'stream-group',
         COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
       });
@@ -485,6 +487,7 @@ describe('streamDirectSessionTokens', () => {
       expect(readPersistedExtraEnv(routing.session.session_file!)).toEqual({
         EXTRA_FLAG: 'kept',
         COVE_AGENT_GROUP_ID: 'stream-group',
+        COVE_SESSION_ID: 'sess-stream-workflow-bridge',
         COVE_WORKFLOW_API_BASE_URL: 'http://host.docker.internal:4111',
       });
     } finally {

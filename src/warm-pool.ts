@@ -12,6 +12,7 @@ type WarmPoolOptions = {
   stateDir: string;
   minSize: number;
   maxSize: number;
+  centralDbPath?: string;
   imageName?: string;
   startingTimeoutMs?: number;
   maintainIntervalMs?: number;
@@ -41,7 +42,7 @@ function warmSessionDir(stateDir: string, sessionId: string): string {
   return path.join(stateDir, 'warm', sessionId);
 }
 
-function seedWarmSessionConfig(sessionDir: string, sessionId: string): void {
+function seedWarmSessionConfig(sessionDir: string, sessionId: string, centralDbPath?: string): void {
   const inboundDb = openInboundDb(sessionDir);
 
   try {
@@ -50,12 +51,15 @@ function seedWarmSessionConfig(sessionDir: string, sessionId: string): void {
       `INSERT INTO session_config (provider, model, thinking_level, api_key, workspace, extra_env, permissions)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(
-      'auto',
-      sessionId,
       null,
       null,
       null,
-      JSON.stringify({ COVE_SESSION_ID: sessionId }),
+      null,
+      null,
+      JSON.stringify({
+        COVE_SESSION_ID: sessionId,
+        ...(centralDbPath == null ? {} : { COVE_CENTRAL_DB_PATH: centralDbPath }),
+      }),
       null,
     );
   } finally {
@@ -144,7 +148,7 @@ export function createWarmPool(options: WarmPoolOptions): WarmPool {
     const sessionDir = warmSessionDir(options.stateDir, sessionId);
 
     fs.mkdirSync(sessionDir, { recursive: true });
-    seedWarmSessionConfig(sessionDir, sessionId);
+    seedWarmSessionConfig(sessionDir, sessionId, options.centralDbPath);
 
     const entry: WarmPoolEntry = {
       sessionId,

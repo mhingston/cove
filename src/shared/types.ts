@@ -48,8 +48,8 @@ export type RoutedRequest = {
 };
 
 export type SessionConfig = {
-  provider: string;
-  model: string;
+  provider: string | null;
+  model: string | null;
   thinking_level?: string | null;
   api_key?: string | null;
   workspace?: string | null;
@@ -143,6 +143,10 @@ export type ProcessingAckInput = {
   heartbeat_at: string;
 };
 
+export type DeliveryDbReader =
+  | { db: Database }
+  | { openDb: () => Database };
+
 export type ChatHandlerContext = {
   routeRequest?(options: {
     db: Database;
@@ -150,8 +154,7 @@ export type ChatHandlerContext = {
     body: ChatRoutingBody;
     stateDir?: string;
   }): RoutedRequest;
-  pollForResponse?(options: {
-    db: Database;
+  pollForResponse?(options: DeliveryDbReader & {
     sessionId: string;
     baselineOutSeq: number;
     timeoutMs?: number;

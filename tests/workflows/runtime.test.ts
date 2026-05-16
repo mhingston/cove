@@ -112,6 +112,26 @@ function createCentralDb(): Database {
   return db;
 }
 
+function updateAgentGroup(options: {
+  db: Database;
+  id?: string;
+  provider?: string;
+  model?: string | null;
+  config?: string | null;
+}): void {
+  options.db.prepare(
+    `UPDATE agent_groups
+     SET provider = ?, model = ?, config = ?, updated_at = ?
+     WHERE id = ?`,
+  ).run(
+    options.provider ?? 'anthropic',
+    options.model ?? null,
+    options.config ?? null,
+    '2026-01-15T08:30:00.000Z',
+    options.id ?? 'support',
+  );
+}
+
 function createFakeRunnerDeps(options: FakeRunnerSessionOptions = {}): ContainerSessionDeps {
   return {
     async createSession(sessionOptions: FakeCreateSessionOptions) {
@@ -802,7 +822,7 @@ describe('workflow runtime', () => {
     createdPaths.push(stateDir);
 
     const centralDb = createCentralDb();
-    const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string }> = [];
+    const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string | null }> = [];
     const pollCalls: Array<{ sessionId: string; baselineOutSeq: number }> = [];
     const runtime = createWorkflowRuntime(databasePath);
     runtime.bindPi(createWorkflowSessionBindings({
@@ -913,6 +933,213 @@ describe('workflow runtime', () => {
     }
   });
 
+  it('preserves a null stored model for __pi_prompt when the agent group has no default model', async () => {
+    const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
+    const databasePath = `${stateDir}/workflows.db`;
+    createdPaths.push(stateDir);
+
+    const centralDb = createCentralDb();
+    updateAgentGroup({
+      db: centralDb,
+      model: null,
+    });
+    const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string | null }> = [];
+    const pollCalls: Array<{ sessionId: string; baselineOutSeq: number }> = [];
+    const runtime = createWorkflowRuntime(databasePath);
+    runtime.bindPi(createWorkflowSessionBindings({
+      db: centralDb,
+      stateDir,
+      ensureSessionRuntime: async ({ routed, config }) => {
+        ensureSessionRuntimeCalls.push({
+          sessionId: routed.session.id,
+          threadId: routed.threadId,
+          model: config.model,
+        });
+        return true;
+      },
+      pollForResponse: async ({ sessionId, baselineOutSeq }) => {
+        pollCalls.push({ sessionId, baselineOutSeq });
+        return [
+          {
+            id: 'out-1',
+            seq: 1,
+            role: 'assistant',
+            content: 'Summarised sales',
+            finish_reason: 'stop',
+            tool_calls: null,
+            metadata: null,
+            created_at: '2026-01-15T09:00:00.000Z',
+          },
+        ];
+      },
+    }));
+
+    runtime.registerDefinition({
+      name: 'prompt-workflow-null-model',
+      description: 'Calls ctx.pi.prompt without a default model',
+      *generator(ctx, input) {
+        const response = yield ctx.pi.prompt(`Summarise ${String(input?.topic ?? '')}`);
+        return {
+          response,
+        };
+      },
+    });
+
+    await runtime.start();
+
+    try {
+      const started = await runtime.workflowService.startWorkflow({
+        id: 'instance-prompt-null-model',
+        name: 'prompt-workflow-null-model',
+        input: { topic: 'sales' },
+        context: {
+          trigger: 'api',
+          agent_group_id: 'support',
+          thread_id: 'workflow:instance-prompt-null-model',
+        },
+      });
+
+      await expect(runtime.workflowService.waitForWorkflow({
+        instanceId: started.instanceId,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      })).resolves.toEqual({
+        instanceId: 'instance-prompt-null-model',
+        name: 'prompt-workflow-null-model',
+        status: 'Completed',
+        customStatus: null,
+        createdAt: expect.any(String),
+        updatedAt: expect.any(String),
+        input: {
+          topic: 'sales',
+        },
+        output: {
+          response: 'Summarised sales',
+        },
+        error: null,
+      });
+
+      const session = centralDb.prepare(
+        'SELECT id, thread_id, session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?',
+      ).get('support', 'workflow:instance-prompt-null-model') as {
+        id: string;
+        thread_id: string;
+        session_file: string;
+      } | null;
+      expect(session).not.toBeNull();
+      expect(ensureSessionRuntimeCalls).toEqual([
+        {
+          sessionId: session!.id,
+          threadId: 'workflow:instance-prompt-null-model',
+          model: null,
+        },
+      ]);
+      expect(pollCalls).toEqual([{ sessionId: session!.id, baselineOutSeq: 0 }]);
+
+      const inboundDb = openInboundDb(session!.session_file);
+      try {
+        const configRow = inboundDb.prepare('SELECT model FROM session_config').get() as { model: string | null } | null;
+        expect(configRow?.model).toBeNull();
+        expect(inboundDb.prepare('SELECT role, content FROM messages_in ORDER BY seq ASC').all()).toEqual([
+          {
+            role: 'user',
+            content: 'Summarise sales',
+          },
+        ]);
+      } finally {
+        inboundDb.close();
+      }
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('fails __pi_prompt when the agent group runtime-prep config is invalid', async () => {
+    const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
+    const databasePath = `${stateDir}/workflows.db`;
+    createdPaths.push(stateDir);
+
+    const centralDb = createCentralDb();
+    updateAgentGroup({
+      db: centralDb,
+      config: '{"provider_env_passthrough":[{"name":""}]}',
+    });
+    const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string | null }> = [];
+    const pollCalls: Array<{ sessionId: string; baselineOutSeq: number }> = [];
+    const runtime = createWorkflowRuntime(databasePath);
+    runtime.bindPi(createWorkflowSessionBindings({
+      db: centralDb,
+      stateDir,
+      ensureSessionRuntime: async ({ routed, config }) => {
+        ensureSessionRuntimeCalls.push({
+          sessionId: routed.session.id,
+          threadId: routed.threadId,
+          model: config.model,
+        });
+        return true;
+      },
+      pollForResponse: async ({ sessionId, baselineOutSeq }) => {
+        pollCalls.push({ sessionId, baselineOutSeq });
+        return [
+          {
+            id: 'out-1',
+            seq: 1,
+            role: 'assistant',
+            content: 'Summarised sales',
+            finish_reason: 'stop',
+            tool_calls: null,
+            metadata: null,
+            created_at: '2026-01-15T09:00:00.000Z',
+          },
+        ];
+      },
+    }));
+
+    runtime.registerDefinition({
+      name: 'prompt-workflow-invalid-config',
+      description: 'Calls ctx.pi.prompt with invalid runtime-prep config',
+      *generator(ctx) {
+        const response = yield ctx.pi.prompt('Summarise sales');
+        return {
+          response,
+        };
+      },
+    });
+
+    await runtime.start();
+
+    try {
+      const started = await runtime.workflowService.startWorkflow({
+        id: 'instance-prompt-invalid-config',
+        name: 'prompt-workflow-invalid-config',
+        input: null,
+        context: {
+          trigger: 'api',
+          agent_group_id: 'support',
+          thread_id: 'workflow:instance-prompt-invalid-config',
+        },
+      });
+
+      await expect(runtime.workflowService.waitForWorkflow({
+        instanceId: started.instanceId,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      })).resolves.toMatchObject({
+        instanceId: 'instance-prompt-invalid-config',
+        name: 'prompt-workflow-invalid-config',
+        status: 'Failed',
+        output: null,
+        error: {
+          message: expect.stringContaining('Invalid agent group config: provider_env_passthrough[0].name must be a non-empty string'),
+        },
+      });
+      expect(ensureSessionRuntimeCalls).toHaveLength(0);
+      expect(pollCalls).toHaveLength(0);
+    } finally {
+      await runtime.stop();
+    }
+  });
+
   it('routes __pi_sendMessage to the targeted session when workflow execution context provides session_id', async () => {
     const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
     const databasePath = `${stateDir}/workflows.db`;
@@ -1015,7 +1242,7 @@ describe('workflow runtime', () => {
       agentGroupId: 'support',
       threadId: 'existing-thread',
     });
-    const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string }> = [];
+    const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string | null }> = [];
     const pollCalls: Array<{ sessionId: string; baselineOutSeq: number }> = [];
     const runtime = createWorkflowRuntime(databasePath);
     runtime.bindPi(createWorkflowSessionBindings({
@@ -1480,8 +1707,10 @@ describe('workflow runtime', () => {
       ]);
       expect(captured.resourceLoaders).toEqual([
         expect.objectContaining({
-          noExtensions: true,
+          agentDir: expect.stringContaining('/.pi-agent'),
+          additionalExtensionPaths: [],
           noSkills: true,
+          extensionFactories: expect.any(Array),
         }),
       ]);
     } finally {
@@ -1562,8 +1791,10 @@ describe('workflow runtime', () => {
       ]);
       expect(captured.resourceLoaders).toEqual([
         expect.objectContaining({
-          noExtensions: true,
+          agentDir: expect.stringContaining('/.pi-agent'),
+          additionalExtensionPaths: [],
           noSkills: false,
+          extensionFactories: expect.any(Array),
         }),
       ]);
     } finally {

@@ -147,16 +147,19 @@ describe('chat completions api', () => {
     }
   });
 
-  it('uses body model as the public agent-group selector and returns an OpenAI-compatible response', async () => {
+  it('treats body model as a model override on the default agent group when no explicit agent group is supplied', async () => {
     const stateDir = makeStateDir();
     process.env.COVE_STATE_DIR = stateDir;
 
     const db = new Database(':memory:');
     migrate(db);
-    insertAgentGroup(db, { id: 'public-model-id' });
+    insertAgentGroup(db, {
+      id: 'default',
+      provider: 'openai',
+      model: 'gpt-4.1-mini',
+    });
 
     try {
-      const app = createApp({ db });
       const response = await createApp({
         db,
         chat: {
@@ -180,7 +183,7 @@ describe('chat completions api', () => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: 'public-model-id',
+            model: 'openai/gpt-4.1',
             messages: [{ role: 'user', content: 'Hello there' }],
           }),
         }),
@@ -192,7 +195,7 @@ describe('chat completions api', () => {
       expect(body.id).toBeDefined();
       expect(body.object).toBe('chat.completion');
       expect(body.created).toEqual(expect.any(Number));
-      expect(body.model).toBe('public-model-id');
+      expect(body.model).toBe('openai/gpt-4.1');
       expect(body.choices).toEqual([
         {
           index: 0,
@@ -203,6 +206,26 @@ describe('chat completions api', () => {
           finish_reason: 'stop',
         },
       ]);
+
+      const sessionRow = db
+        .prepare('SELECT agent_group_id, session_file FROM sessions WHERE thread_id = ?')
+        .get('default') as { agent_group_id: string; session_file: string | null };
+      expect(sessionRow.agent_group_id).toBe('default');
+
+      const inboundDb = new Database(path.join(sessionRow.session_file!, 'inbound.db'));
+
+      try {
+        const configRow = inboundDb.prepare('SELECT provider, model FROM session_config').get() as {
+          provider: string | null;
+          model: string | null;
+        };
+        expect(configRow).toEqual({
+          provider: 'openai',
+          model: 'openai/gpt-4.1',
+        });
+      } finally {
+        inboundDb.close();
+      }
     } finally {
       db.close();
     }
@@ -281,7 +304,12 @@ describe('chat completions api', () => {
           thinking_level: 'high',
           api_key: 'sk-chat-test',
           workspace: '/workspace/chat-group-1',
-          extra_env: '{"CUSTOM_FLAG":"enabled"}',
+          extra_env: JSON.stringify({
+            CUSTOM_FLAG: 'enabled',
+            COVE_SESSION_ID: sessionRow.id,
+            COVE_AGENT_GROUP_ID: 'chat-group-1',
+            COVE_CENTRAL_DB_PATH: path.join(stateDir, 'cove.db'),
+          }),
           permissions: '{"default":"ask"}',
         });
         expect(inboundRows).toEqual([
@@ -500,7 +528,7 @@ describe('chat completions api', () => {
         id: `chatcmpl-${sessionRow.id}`,
         object: 'chat.completion',
         created: expect.any(Number),
-        model: 'chat-group-1',
+        model: 'anthropic/group-model',
         choices: [
           {
             index: 0,
@@ -751,8 +779,8 @@ describe('chat completions api', () => {
         expect(response.status).toBe(200);
 
         const sessionRow = db
-          .prepare('SELECT session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?')
-          .get('chat-group-1', 'thread-mcp') as { session_file: string | null };
+          .prepare('SELECT id, session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?')
+          .get('chat-group-1', 'thread-mcp') as { id: string; session_file: string | null };
 
         const inboundDb = new Database(path.join(sessionRow.session_file!, 'inbound.db'));
 
@@ -763,6 +791,9 @@ describe('chat completions api', () => {
           const extraEnv = JSON.parse(configRow.extra_env ?? '{}') as Record<string, string>;
 
           expect(extraEnv.CUSTOM_FLAG).toBe('enabled');
+          expect(extraEnv.COVE_SESSION_ID).toBe(sessionRow.id);
+          expect(extraEnv.COVE_AGENT_GROUP_ID).toBe('chat-group-1');
+          expect(extraEnv.COVE_CENTRAL_DB_PATH).toBe(path.join(stateDir, 'cove.db'));
           expect(extraEnv.COVE_MCP_CONFIG).toBeTruthy();
           expect(JSON.parse(extraEnv.COVE_MCP_CONFIG)).toEqual(expectedMcpConfig);
         } finally {
@@ -771,6 +802,39 @@ describe('chat completions api', () => {
       } finally {
         db.close();
       }
+    }
+  });
+
+  it('returns 400 when the routed agent group runtime-prep config is invalid', async () => {
+    const stateDir = makeStateDir();
+    process.env.COVE_STATE_DIR = stateDir;
+
+    const db = new Database(':memory:');
+    migrate(db);
+    insertAgentGroup(db, {
+      id: 'chat-group-1',
+      config: '{"provider_env_passthrough":[{"name":""}]}',
+    });
+
+    try {
+      const response = await createApp({ db }).fetch(
+        new Request('http://cove.test/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            agent_group_id: 'chat-group-1',
+            thread_id: 'thread-invalid-config',
+            messages: [{ role: 'user', content: 'Hello from the user' }],
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(400);
+      expect(await json(response)).toEqual({
+        error: 'Invalid agent group config: provider_env_passthrough[0].name must be a non-empty string',
+      });
+    } finally {
+      db.close();
     }
   });
 

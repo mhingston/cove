@@ -60,7 +60,6 @@ function resolveAgentGroupId(options: ResolveThreadIdOptions): string {
   return (
     normalizeText(options.body.agent_group_id) ??
     normalizeText(options.request.headers.get('X-Agent-Group-Id')) ??
-    normalizeText(options.body.model) ??
     'default'
   );
 }

@@ -1,12 +1,12 @@
 import type { Database } from 'bun:sqlite';
 import type { AgentMessage, AgentToolResult } from '@mariozechner/pi-agent-core';
 
-import { getNextOutboundSeq, openOutboundDb, readProcessingAck, writeOutboundMessage, writeProcessingAck } from '../session/outbound.ts';
+import { getNextOutboundSeq, openExistingOutboundDb, openOutboundDb, readProcessingAck, writeOutboundMessage, writeProcessingAck } from '../session/outbound.ts';
 import { openInboundDb, writeInboundMessage } from '../session/inbound.ts';
 import { ensureSessionForRuntime } from '../session/manager.ts';
+import { buildAgentGroupSessionConfig } from '../session-config.ts';
 import { routeRequest } from '../router.ts';
 import { pollForResponse as defaultPollForResponse } from '../delivery.ts';
-import { resolveRuntimeMcpConfig, serializeRuntimeMcpConfig } from '../integrations/mcp.ts';
 import type { ChatHandlerContext, ChatMessage, SessionConfig } from '../shared/types.ts';
 import type { AgentGroupRow, RoutedRequest, SessionRow } from '../shared/types.ts';
 import {
@@ -98,56 +98,8 @@ function buildWorkflowSessionConfig(options: {
   };
 }
 
-function parseAgentGroupConfig(configValue: string | null): {
-  api_key?: string;
-  credential_profile?: string;
-  extra_env?: Record<string, string>;
-} | null {
-  if (configValue == null || configValue.trim() === '') {
-    return null;
-  }
-
-  try {
-    return JSON.parse(configValue) as {
-      api_key?: string;
-      credential_profile?: string;
-      extra_env?: Record<string, string>;
-    };
-  } catch {
-    return null;
-  }
-}
-
 function buildScheduledSessionConfig(agentGroup: AgentGroupRow): SessionConfig {
-  const parsedConfig = parseAgentGroupConfig(agentGroup.config);
-  const hasOneCliGatewayEnv = (process.env.ONECLI_AGENT_NAME?.trim() ?? '') !== ''
-    && (process.env.ONECLI_URL?.trim() ?? '') !== '';
-  const oneCliAuthEnabled = (() => {
-    const rawValue = parsedConfig?.extra_env?.COVE_ONECLI_AUTH ?? process.env.COVE_ONECLI_AUTH;
-
-    if (rawValue == null) {
-      return true;
-    }
-
-    const normalized = rawValue.trim().toLowerCase();
-    return normalized !== '0' && normalized !== 'false' && normalized !== 'off' && normalized !== 'disabled';
-  })();
-  const mcpConfig = serializeRuntimeMcpConfig(resolveRuntimeMcpConfig(parsedConfig ?? undefined)) ?? null;
-  const extraEnv = {
-    ...(parsedConfig?.extra_env ?? {}),
-    ...(parsedConfig?.credential_profile == null ? {} : { credential_profile: parsedConfig.credential_profile }),
-    ...(mcpConfig == null ? {} : { COVE_MCP_CONFIG: mcpConfig }),
-  };
-
-  return {
-    provider: agentGroup.provider,
-    model: agentGroup.model || agentGroup.id,
-    thinking_level: agentGroup.thinking,
-    api_key: oneCliAuthEnabled && hasOneCliGatewayEnv ? null : parsedConfig?.api_key ?? null,
-    workspace: agentGroup.workspace,
-    extra_env: Object.keys(extraEnv).length > 0 ? extraEnv : null,
-    permissions: agentGroup.permissions,
-  };
+  return buildAgentGroupSessionConfig(agentGroup);
 }
 
 function writeSessionConfig(db: Database, config: SessionConfig): void {
@@ -266,7 +218,7 @@ export function createWorkflowSessionBindings(options: {
       throw new Error('Session runtime is unavailable');
     }
 
-    const outboundBaselineDb = openOutboundDb(sessionDir);
+    const outboundBaselineDb = openExistingOutboundDb(sessionDir);
     let baselineOutSeq = 0;
 
     try {
@@ -295,19 +247,13 @@ export function createWorkflowSessionBindings(options: {
       inboundDb.close();
     }
 
-    const outboundDb = openOutboundDb(sessionDir);
+    const messages = await pollForResponse({
+      openDb: () => openExistingOutboundDb(sessionDir),
+      sessionId: args.routed.session.id,
+      baselineOutSeq,
+    });
 
-    try {
-      const messages = await pollForResponse({
-        db: outboundDb,
-        sessionId: args.routed.session.id,
-        baselineOutSeq,
-      });
-
-      return messages.map((message) => message.content).join('');
-    } finally {
-      outboundDb.close();
-    }
+    return messages.map((message) => message.content).join('');
   }
 
   async function prepareWorkflowHostSession(args: {

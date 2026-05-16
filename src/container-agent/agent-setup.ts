@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 
-export type SupportedContainerAgentProvider = 'anthropic';
+export type SupportedContainerAgentProvider = string;
 
 export type ContainerAgentSetupOptions = {
   provider: string;
@@ -55,11 +55,13 @@ function normalizeText(value: string | null | undefined): string | undefined {
 }
 
 function toSupportedProvider(value: string): SupportedContainerAgentProvider {
-  if (value === 'anthropic') {
-    return value;
+  const provider = normalizeText(value);
+
+  if (provider == null) {
+    throw new Error('Container agent provider is required.');
   }
 
-  throw new Error(`Unsupported container agent provider '${value}'.`);
+  return provider;
 }
 
 export function resolveContainerAgentModel(options: {

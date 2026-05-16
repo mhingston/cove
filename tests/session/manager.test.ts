@@ -67,8 +67,8 @@ describe('session DB helpers', () => {
     expect(journalModeRow?.journal_mode.toLowerCase()).toBe('delete');
     expect(tables.map((table) => table.name)).toEqual(['messages_in', 'session_config']);
     expect(sessionConfigSql).toBe(`CREATE TABLE session_config (
-      provider       TEXT NOT NULL,
-      model          TEXT NOT NULL,
+      provider       TEXT,
+      model          TEXT,
       thinking_level TEXT,
       api_key        TEXT,
       workspace      TEXT,
@@ -76,8 +76,8 @@ describe('session DB helpers', () => {
       permissions    TEXT
     )`);
     expect(sessionConfigColumns).toEqual([
-      { name: 'provider', type: 'TEXT', notnull: 1, pk: 0 },
-      { name: 'model', type: 'TEXT', notnull: 1, pk: 0 },
+      { name: 'provider', type: 'TEXT', notnull: 0, pk: 0 },
+      { name: 'model', type: 'TEXT', notnull: 0, pk: 0 },
       { name: 'thinking_level', type: 'TEXT', notnull: 0, pk: 0 },
       { name: 'api_key', type: 'TEXT', notnull: 0, pk: 0 },
       { name: 'workspace', type: 'TEXT', notnull: 0, pk: 0 },

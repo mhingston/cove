@@ -341,4 +341,103 @@ describe('delivery', () => {
     ]);
     expect(sleepCalls).toBe(3);
   });
+
+  it('polls successfully when the caller provides openDb instead of a shared db handle', async () => {
+    const sessionDir = makeTempSessionDir();
+    const db = openOutboundDb(sessionDir);
+    openDbs.push(db);
+
+    writeOutboundMessage(db, {
+      id: 'out-3',
+      seq: 3,
+      role: 'assistant',
+      content: 'reply',
+    });
+    writeProcessingAck(db, {
+      session_id: 'session-1',
+      last_in_seq: 2,
+      last_out_seq: 3,
+      heartbeat_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const delivered = await pollForResponse({
+      openDb: () => openOutboundDb(sessionDir),
+      sessionId: 'session-1',
+      baselineOutSeq: 1,
+    });
+
+    expect(delivered).toEqual([
+      expect.objectContaining({ id: 'out-3', seq: 3, content: 'reply' }),
+    ]);
+  });
+
+  it('treats the first assistant reply at seq 3 as deliverable when baselineOutSeq is 0', async () => {
+    const db = createOutboundDb();
+    let currentTime = 0;
+
+    writeOutboundMessage(db, {
+      id: 'out-3',
+      seq: 3,
+      role: 'assistant',
+      content: 'first reply',
+    });
+    writeProcessingAck(db, {
+      session_id: 'session-1',
+      last_in_seq: 2,
+      last_out_seq: 3,
+      heartbeat_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const delivered = await pollForResponse({
+      db,
+      sessionId: 'session-1',
+      baselineOutSeq: 0,
+      timeoutMs: 1,
+      pollIntervalMs: 1,
+      now: () => currentTime,
+      sleep: async (ms) => {
+        currentTime += ms;
+      },
+    });
+
+    expect(delivered).toEqual([
+      expect.objectContaining({ id: 'out-3', seq: 3, content: 'first reply' }),
+    ]);
+  });
+
+  it('allows a slower provider reply within the default delivery timeout window', async () => {
+    const db = createOutboundDb();
+    let currentTime = 0;
+    let wroteReply = false;
+
+    const delivered = await pollForResponse({
+      db,
+      sessionId: 'session-1',
+      baselineOutSeq: 1,
+      now: () => currentTime,
+      sleep: async (ms) => {
+        currentTime += ms;
+
+        if (!wroteReply && currentTime >= 6_000) {
+          wroteReply = true;
+          writeOutboundMessage(db, {
+            id: 'out-3',
+            seq: 3,
+            role: 'assistant',
+            content: 'slow reply',
+          });
+          writeProcessingAck(db, {
+            session_id: 'session-1',
+            last_in_seq: 2,
+            last_out_seq: 3,
+            heartbeat_at: '2026-01-01T00:00:06.000Z',
+          });
+        }
+      },
+    });
+
+    expect(delivered).toEqual([
+      expect.objectContaining({ id: 'out-3', seq: 3, content: 'slow reply' }),
+    ]);
+  });
 });

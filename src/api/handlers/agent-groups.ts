@@ -1,6 +1,7 @@
 import type { Database } from 'bun:sqlite';
 
 import { stopAndForgetContainersForAgentGroup } from '../../container/spawn.ts';
+import { normalizeRuntimePrepConfig, type RuntimePrepConfig } from '../../runtime-prep-config.ts';
 import type { AgentGroupRow } from '../../shared/types.ts';
 
 type AgentGroupApiRow = Omit<AgentGroupRow, 'permissions' | 'config'> & {
@@ -113,7 +114,7 @@ function parseOptionalJsonObjectOrNull(value: unknown, fieldName: string): Recor
   return value;
 }
 
-function serializeJson(value: Record<string, unknown> | null): string | null {
+function serializeJson(value: unknown): string | null {
   return value == null ? null : JSON.stringify(value);
 }
 
@@ -135,7 +136,7 @@ type CreateAgentGroupInput = {
   thinking: string;
   permissions: Record<string, unknown>;
   soul: string | null;
-  config: Record<string, unknown> | null;
+  config: RuntimePrepConfig | null;
 };
 
 type UpdateAgentGroupPatch = {
@@ -147,7 +148,7 @@ type UpdateAgentGroupPatch = {
   thinking?: string;
   permissions?: Record<string, unknown>;
   soul?: string | null;
-  config?: Record<string, unknown> | null;
+  config?: RuntimePrepConfig | null;
 };
 
 function parseCreateBody(body: unknown): CreateAgentGroupInput {
@@ -167,7 +168,7 @@ function parseCreateBody(body: unknown): CreateAgentGroupInput {
       ? { default: 'auto' }
       : parseRequiredJsonObject(body.permissions, 'permissions'),
     soul: parseOptionalNullableString(body.soul, 'soul') ?? null,
-    config: parseOptionalJsonObjectOrNull(body.config, 'config') ?? null,
+    config: normalizeRuntimePrepConfig(parseOptionalJsonObjectOrNull(body.config, 'config') ?? null),
   };
 }
 
@@ -211,7 +212,7 @@ function parseUpdateBody(body: unknown): UpdateAgentGroupPatch {
   }
 
   if (body.config !== undefined) {
-    patch.config = parseOptionalJsonObjectOrNull(body.config, 'config');
+    patch.config = normalizeRuntimePrepConfig(parseOptionalJsonObjectOrNull(body.config, 'config'));
   }
 
   return patch;
@@ -371,6 +372,7 @@ function mapAgentGroupError(error: unknown): Response {
     || message === 'permissions must be an object'
     || message === 'soul must be a string or null'
     || message === 'config must be an object or null'
+    || message.startsWith('Invalid agent group config:')
   ) {
     return jsonResponse({ error: message }, 400);
   }

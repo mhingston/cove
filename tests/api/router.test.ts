@@ -167,7 +167,7 @@ describe('router', () => {
     expect(routed.session.agent_group_id).toBe('header-group');
   });
 
-  it('routeRequest falls back to body model before default', () => {
+  it('routeRequest falls back to the default agent group when only body model is provided', () => {
     const stateDir = makeStateDir();
 
     db = new Database(':memory:');
@@ -185,8 +185,8 @@ describe('router', () => {
       stateDir,
     });
 
-    expect(routed.agentGroup.id).toBe('model-group');
-    expect(routed.session.agent_group_id).toBe('model-group');
+    expect(routed.agentGroup.id).toBe('default');
+    expect(routed.session.agent_group_id).toBe('default');
   });
 
   it('routeRequest falls back to default agent group when selectors are absent', () => {

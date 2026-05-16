@@ -176,6 +176,7 @@ export async function* streamDirectSessionTokens(
     ...configWithPersona,
     extra_env: {
       ...(configWithPersona.extra_env ?? {}),
+      COVE_SESSION_ID: request.routing.session.id,
       COVE_AGENT_GROUP_ID: request.routing.agentGroup.id,
       ...(hostCentralDbPath == null ? {} : { COVE_CENTRAL_DB_PATH: hostCentralDbPath }),
       ...(configWithPersona.extra_env?.COVE_WORKFLOW_API_BASE_URL == null

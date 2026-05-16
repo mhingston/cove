@@ -15,6 +15,7 @@ const gatewayEnvKeys = [
   'ONECLI_AGENT_NAME',
   'ONECLI_URL',
   'COVE_ONECLI_AUTH',
+  'GH_TOKEN',
 ] as const;
 const originalGatewayEnv = Object.fromEntries(
   gatewayEnvKeys.map((key) => [key, process.env[key]]),
@@ -371,6 +372,50 @@ describe('container runner phase 5', () => {
     ]);
   });
 
+  it('processes queued inbound work when inbound.db is reopened read-only', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-readonly-inbound-');
+    const sessionId = 'sess-readonly-inbound-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+    });
+    writeUserMessage(sessionDir, 'Process the read-only inbound queue.');
+
+    fs.chmodSync(path.join(sessionDir, 'inbound.db'), 0o444);
+
+    const captured = {
+      promptedMessages: [] as string[],
+    };
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createFakeDeps({
+        responseText: 'Processed from read-only inbound',
+        capture: captured,
+      }),
+    );
+
+    expect(captured.promptedMessages).toEqual(['Process the read-only inbound queue.']);
+    expect(readOutboundRows(sessionDir)).toEqual([
+      expect.objectContaining({ seq: 3, content: 'Processed from read-only inbound' }),
+    ]);
+    expect(readAck(sessionDir, sessionId)).toMatchObject({
+      last_in_seq: 2,
+      last_out_seq: 3,
+    });
+  });
+
   it('merges extra_env with persisted values taking precedence over runtime conflicts', async () => {
     const sessionDir = makeTempDir('cove-v2-runner-extra-env-merge-');
     const sessionId = 'sess-extra-env-merge-1';
@@ -416,6 +461,56 @@ describe('container runner phase 5', () => {
       SHARED_KEY: 'persisted',
       RUNTIME_ONLY: 'runtime-only',
       PERSISTED_ONLY: 'persisted-only',
+    });
+  });
+
+  it('preserves the warm processing_ack row when a live session adopts the session directory', async () => {
+    const stateDir = makeTempDir('cove-v2-runner-adopted-warm-session-');
+    const warmSessionId = 'warm-123';
+    const liveSessionId = 'sess-live-123';
+    const sessionDir = path.join(stateDir, 'warm', warmSessionId);
+
+    fs.mkdirSync(sessionDir, { recursive: true });
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_SESSION_ID: liveSessionId,
+      },
+    });
+
+    const outboundDb = openOutboundDb(sessionDir);
+
+    try {
+      writeProcessingAck(outboundDb, {
+        session_id: warmSessionId,
+        last_in_seq: null,
+        last_out_seq: null,
+        heartbeat_at: '2026-01-01T00:00:00.000Z',
+      });
+    } finally {
+      outboundDb.close();
+    }
+
+    const response = await runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      config: {
+        provider: 'anthropic',
+        model: 'claude-runner',
+      },
+    });
+
+    expect(response).toBe('');
+    expect(readAck(sessionDir, warmSessionId)).toMatchObject({
+      session_id: warmSessionId,
+      last_in_seq: null,
+      last_out_seq: null,
+    });
+    expect(readAck(sessionDir, liveSessionId)).toMatchObject({
+      session_id: liveSessionId,
+      last_in_seq: null,
+      last_out_seq: null,
     });
   });
 
@@ -1415,6 +1510,85 @@ describe('container runner phase 5', () => {
     ]);
   });
 
+  it('reopens outbound.db for writes after the database file is replaced during prompt execution', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-outbound-reopen-');
+    const sessionId = 'sess-outbound-reopen-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+    });
+    writeUserMessage(sessionDir, 'Process after outbound replacement.');
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      {
+        async createSession() {
+          const listeners = new Set<(event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void>();
+
+          return {
+            session: {
+              subscribe(handler) {
+                listeners.add(handler);
+                return () => {
+                  listeners.delete(handler);
+                };
+              },
+              async prompt(message) {
+                expect(message).toBe('Process after outbound replacement.');
+
+                const originalPath = path.join(sessionDir, 'outbound.db');
+                const replacementPath = path.join(sessionDir, 'outbound-replacement.db');
+                const originalDb = openOutboundDb(sessionDir);
+
+                try {
+                  originalDb.exec('PRAGMA wal_checkpoint(FULL)');
+                } finally {
+                  originalDb.close();
+                }
+
+                fs.copyFileSync(originalPath, replacementPath);
+                fs.renameSync(replacementPath, originalPath);
+
+                for (const listener of listeners) {
+                  listener({
+                    type: 'message_update',
+                    assistantMessageEvent: {
+                      type: 'text_delta',
+                      delta: 'Recovered after outbound replacement',
+                    },
+                  });
+                }
+              },
+            },
+          };
+        },
+      },
+    );
+
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 3,
+        content: 'Recovered after outbound replacement',
+        metadata: null,
+      },
+    ]);
+    expect(readAck(sessionDir, sessionId)).toMatchObject({
+      last_in_seq: 2,
+      last_out_seq: 3,
+    });
+  });
+
   it('passes runtime tool scope into createCoveTools and forwards custom tools into session creation', async () => {
     const stateDir = makeTempDir('cove-v2-runner-tools-state-');
     const sessionDir = path.join(stateDir, 'sessions', 'group-tools-runtime', 'sess-tools-runtime');
@@ -1474,7 +1648,66 @@ describe('container runner phase 5', () => {
     expect(captured.customTools?.map((tool) => tool.name)).toEqual(['wiki_search']);
   });
 
-  it('writes a session-local MCP config file and passes locked-down resource-loader options when runtime MCP config is present', async () => {
+  it('prefers the runtime central db path over a persisted host-only session_config path for live tool scope', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-runtime-central-db-');
+    const sessionId = 'sess-runtime-central-db-1';
+    const agentGroupId = 'group-runtime-central-db';
+    const originalCentralDbPath = process.env.COVE_CENTRAL_DB_PATH;
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: agentGroupId,
+        COVE_CENTRAL_DB_PATH: '/host-only/cove.db',
+      },
+    });
+    writeUserMessage(sessionDir, 'Use the live tool scope.');
+
+    const captured: { runtime?: Record<string, unknown> } = {};
+
+    try {
+      process.env.COVE_CENTRAL_DB_PATH = '/app/session/cove.db';
+
+      await runContainerSession(
+        {
+          inboundPath: path.join(sessionDir, 'inbound.db'),
+          outboundPath: path.join(sessionDir, 'outbound.db'),
+          sessionId,
+          config: {
+            provider: 'anthropic',
+            model: 'claude-runner',
+          },
+        },
+        undefined,
+        {
+          async createSession(sessionOptions) {
+            return createFakeDeps().createSession!(sessionOptions);
+          },
+          createCoveTools(_db, _embedTexts, runtime) {
+            captured.runtime = runtime as Record<string, unknown> | undefined;
+            return [{
+              name: 'wiki_search',
+              description: 'Test tool',
+              parameters: { type: 'object', properties: {} },
+              execute: async () => ({ content: [{ type: 'text', text: '{}' }], details: {} }),
+            }];
+          },
+        },
+      );
+    } finally {
+      restoreEnvVar('COVE_CENTRAL_DB_PATH', originalCentralDbPath);
+    }
+
+    expect(captured.runtime).toEqual({
+      agentGroupId,
+      centralDbPath: '/app/session/cove.db',
+      sessionId,
+      workflowApiBaseUrl: undefined,
+    });
+  });
+
+  it('writes a session-local MCP config file and uses the session-local overlay agentDir when runtime MCP config is present', async () => {
     const sessionDir = makeTempDir('cove-v2-runner-mcp-');
     const sessionId = 'sess-mcp-1';
 
@@ -1533,11 +1766,43 @@ describe('container runner phase 5', () => {
       cwd: process.cwd(),
       agentDir: path.join(sessionDir, '.pi-agent'),
       additionalExtensionPaths: ['/tmp/node_modules/pi-mcp-adapter'],
-      noExtensions: true,
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      noContextFiles: true,
+      extensionFactories: expect.any(Array),
+    }));
+  });
+
+  it('uses the session-local overlay agentDir even when runtime MCP config is absent', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-overlay-agent-dir-');
+    const sessionId = 'sess-overlay-agent-dir-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+    });
+    writeUserMessage(sessionDir, 'Use overlay agent dir');
+
+    const captured = {
+      promptedMessages: [] as string[],
+      resourceLoaders: [] as Array<unknown>,
+    };
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createFakeDeps({ capture: captured }),
+    );
+
+    expect(captured.resourceLoaders).toContainEqual(expect.objectContaining({
+      cwd: process.cwd(),
+      agentDir: path.join(sessionDir, '.pi-agent'),
       extensionFactories: expect.any(Array),
     }));
   });
@@ -1706,6 +1971,94 @@ describe('container runner phase 5', () => {
     }));
   });
 
+  it('fails startup when the materialized inherited extension set is unsupported', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-unsupported-extension-');
+    const sessionId = 'sess-unsupported-extension-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: 'group-unsupported-extension',
+      },
+    });
+    writeUserMessage(sessionDir, 'Use inherited extensions');
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey() {},
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession() {
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+          },
+        };
+      },
+    }));
+
+    const packageDir = makeTempDir('cove-v2-runner-pi-coding-agent-package-');
+    fs.mkdirSync(path.join(packageDir, 'dist', 'core'), { recursive: true });
+    fs.writeFileSync(path.join(packageDir, 'dist', 'config.js'), 'export function getAgentDir() { return "/tmp/pi-agent-base"; }\n', 'utf8');
+    fs.writeFileSync(
+      path.join(packageDir, 'dist', 'core', 'resource-loader.js'),
+      `export class DefaultResourceLoader {
+         constructor(options) { this.options = options; }
+         async reload() {}
+         getExtensions() {
+           return [{ sourcePath: '/tmp/pi-agent-base/extensions/unsafe.js' }];
+         }
+       }
+      `,
+      'utf8',
+    );
+
+    const deps: ContainerSessionDeps = {
+      resolveInstalledPackageDir(packageName) {
+        return packageName === '@mariozechner/pi-coding-agent' ? packageDir : undefined;
+      },
+    };
+
+    await expect(runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      deps,
+    )).rejects.toThrow('Unsupported inherited extension');
+  });
+
   it('registers persona and assembled-context extension hooks for agent-group runtimes', async () => {
     const stateDir = makeTempDir('cove-v2-runner-context-state-');
     const sessionDir = path.join(stateDir, 'sessions', 'group-context-1', 'sess-context-1');
@@ -1832,6 +2185,7 @@ describe('container runner phase 5', () => {
 
     const promptedMessages: string[] = [];
     const resourceLoaders: Array<unknown> = [];
+    let capturedSessionManager: { mode: string; cwd?: string; sessionStateDir?: string } | undefined;
 
     mock.module('@mariozechner/pi-coding-agent', () => ({
       AuthStorage: {
@@ -1863,6 +2217,7 @@ describe('container runner phase 5', () => {
         sessionManager?: { mode: string; cwd?: string; sessionStateDir?: string };
         resourceLoader?: unknown;
       }) {
+        capturedSessionManager = sessionOptions.sessionManager;
         resourceLoaders.push(sessionOptions.resourceLoader);
         const listeners = new Set<(event: { type: 'message_update'; assistantMessageEvent?: { type: 'text_delta'; delta: string } }) => void>();
 
@@ -1925,6 +2280,11 @@ describe('container runner phase 5', () => {
     });
     expect(promptedMessages).toEqual(['Use the production default setup path.']);
     expect(resourceLoaders).toHaveLength(1);
+    expect(capturedSessionManager).toEqual({
+      mode: 'continueRecent',
+      cwd: process.cwd(),
+      sessionStateDir: path.join(sessionDir, '.pi-agent', 'sessions'),
+    });
   });
 
   it('reuses the same auth-backed model registry across the production default setup path', async () => {
@@ -2437,7 +2797,73 @@ describe('container runner phase 5', () => {
     expect(readAck(sessionDir, sessionId)).toBeNull();
   });
 
-  it('fails before startup for auto provider paths that resolve to unsupported providers', async () => {
+  it('accepts inherited GitHub Copilot env auth without requiring an API key fallback', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-copilot-env-auth-');
+    const sessionId = 'sess-copilot-env-auth-1';
+    const authCalls: Array<{ provider: string; apiKey: string | null | undefined }> = [];
+
+    clearGatewayEnvForTest();
+    process.env.GH_TOKEN = 'gh-host-token';
+
+    mock.module('@mariozechner/pi-coding-agent', () => ({
+      AuthStorage: {
+        inMemory() {
+          return {
+            setRuntimeApiKey(provider: string, apiKey: string) {
+              authCalls.push({ provider, apiKey });
+            },
+          };
+        },
+      },
+      ModelRegistry: {
+        inMemory() {
+          return {
+            find(provider: string, model: string) {
+              return { provider, id: model };
+            },
+          };
+        },
+      },
+      SessionManager: {
+        inMemory(cwd?: string) {
+          return { mode: 'in-memory', cwd };
+        },
+        continueRecent(cwd?: string, sessionStateDir?: string) {
+          return { mode: 'continueRecent', cwd, sessionStateDir };
+        },
+      },
+      async createAgentSession() {
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+          },
+        };
+      },
+    }));
+
+    writeSessionConfig(sessionDir, {
+      provider: 'github-copilot',
+      model: 'gpt-4.1',
+    });
+    writeUserMessage(sessionDir, 'Use inherited GitHub Copilot env auth.');
+
+    await expect(runContainerSession({
+      inboundPath: path.join(sessionDir, 'inbound.db'),
+      outboundPath: path.join(sessionDir, 'outbound.db'),
+      sessionId,
+      config: {
+        provider: 'github-copilot',
+        model: 'gpt-4.1',
+      },
+    })).resolves.toBe('');
+
+    expect(authCalls).toEqual([]);
+  });
+
+  it('supports auto provider paths that resolve to non-Anthropic providers', async () => {
     const sessionDir = makeTempDir('cove-v2-runner-auto-unsupported-provider-1');
     const sessionId = 'sess-auto-unsupported-provider-1';
 
@@ -2469,8 +2895,21 @@ describe('container runner phase 5', () => {
           return { mode: 'continueRecent', cwd, sessionStateDir };
         },
       },
-      async createAgentSession() {
-        throw new Error('createAgentSession should not be reached for unsupported providers');
+      async createAgentSession(sessionOptions: {
+        model?: { provider: string; id: string };
+      }) {
+        return {
+          session: {
+            subscribe() {
+              return () => {};
+            },
+            async prompt() {},
+            async waitForIdle() {},
+            getLastAssistantText() {
+              return `resolved:${sessionOptions.model?.provider}/${sessionOptions.model?.id}`;
+            },
+          },
+        };
       },
     }));
 
@@ -2478,7 +2917,7 @@ describe('container runner phase 5', () => {
       provider: 'auto',
       model: 'openai/gpt-4o-mini',
     });
-    writeUserMessage(sessionDir, 'This should fail for unsupported auto provider paths.');
+    writeUserMessage(sessionDir, 'This should succeed for generic auto provider paths.');
 
     await expect(runContainerSession({
       inboundPath: path.join(sessionDir, 'inbound.db'),
@@ -2488,10 +2927,16 @@ describe('container runner phase 5', () => {
         provider: 'anthropic',
         model: 'claude-runner',
       },
-    })).rejects.toThrow("Unsupported container agent provider 'openai'.");
+    })).resolves.toBe('resolved:openai/gpt-4o-mini');
 
-    expect(readOutboundRows(sessionDir)).toEqual([]);
-    expect(readAck(sessionDir, sessionId)).toBeNull();
+    const ack = readAck(sessionDir, sessionId);
+    expect(ack?.last_in_seq).toBe(2);
+    expect(ack?.last_out_seq).toBeGreaterThan(0);
+    expect(readOutboundRows(sessionDir)).toEqual([
+      expect.objectContaining({
+        content: 'resolved:openai/gpt-4o-mini',
+      }),
+    ]);
   });
 
   it('throws setup failures without writing an assistant row or advancing ack state', async () => {

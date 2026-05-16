@@ -18,6 +18,8 @@ import {
 const tempDirs: string[] = [];
 const originalRuntimeBin = process.env.COVE_CONTAINER_RUNTIME_BIN;
 const gatewayEnvKeys = [
+  'HOME',
+  'PI_CODING_AGENT_DIR',
   'HTTPS_PROXY',
   'HTTP_PROXY',
   'https_proxy',
@@ -27,6 +29,14 @@ const gatewayEnvKeys = [
   'SSL_CERT_DIR',
   'ONECLI_AGENT_NAME',
   'ONECLI_URL',
+  'OPENAI_API_KEY',
+  'COPILOT_GITHUB_TOKEN',
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'CUSTOM_TOKEN',
+  'CUSTOM_CRED_FILE',
+  'UNRELATED_HOST_SECRET',
   'AWS_SECRET_ACCESS_KEY',
 ] as const;
 const originalGatewayEnv = Object.fromEntries(
@@ -101,13 +111,23 @@ describe('container manager', () => {
     expect(args).toContain('/tmp/cove-state/cove.db:/app/session/cove.db');
   });
 
+  it('buildContainerArgs exports the mounted central db path to the container runtime', () => {
+    const args = buildContainerArgs({
+      ...baseOptions,
+      centralDbPath: '/tmp/cove-state/cove.db',
+    });
+
+    expect(args).toContain('COVE_CENTRAL_DB_PATH=/app/session/cove.db');
+  });
+
   it('buildContainerArgs injects only allowlisted OneCLI gateway env from the host', () => {
     process.env.HTTPS_PROXY = 'https://proxy.example';
     process.env.http_proxy = 'http://proxy.example';
     process.env.NODE_EXTRA_CA_CERTS = '/tmp/certs.pem';
     process.env.ONECLI_AGENT_NAME = 'cove-agent';
     process.env.ONECLI_URL = 'https://onecli.example';
-    process.env.AWS_SECRET_ACCESS_KEY = 'should-not-leak';
+    process.env.AWS_SECRET_ACCESS_KEY = 'aws-secret';
+    process.env.UNRELATED_HOST_SECRET = 'should-not-leak';
 
     const args = buildContainerArgs({
       ...baseOptions,
@@ -121,8 +141,9 @@ describe('container manager', () => {
     expect(args).toContain('NODE_EXTRA_CA_CERTS=/tmp/certs.pem');
     expect(args).toContain('ONECLI_AGENT_NAME=cove-agent');
     expect(args).toContain('ONECLI_URL=https://onecli.example');
+    expect(args).toContain('AWS_SECRET_ACCESS_KEY=aws-secret');
     expect(args).toContain('COVE_SESSION_ID=live-1');
-    expect(args).not.toContain('AWS_SECRET_ACCESS_KEY=should-not-leak');
+    expect(args).not.toContain('UNRELATED_HOST_SECRET=should-not-leak');
   });
 
   it('buildContainerArgs does not let container env overrides replace allowlisted host OneCLI gateway env', () => {
@@ -148,6 +169,64 @@ describe('container manager', () => {
     expect(args).not.toContain('ONECLI_URL=https://override-onecli.example');
   });
 
+  it('buildContainerArgs mounts the shared Pi dir, credential dirs, and rewrites built-in and custom provider file env paths', () => {
+    const homeDir = makeTempDir('cove-v2-manager-home-');
+    const piAgentDir = path.join(homeDir, '.pi', 'agent');
+    const awsDir = path.join(homeDir, '.aws');
+    const gcloudDir = path.join(homeDir, '.config', 'gcloud');
+    const googleCredentialsPath = path.join(homeDir, 'google-credentials.json');
+    const customCredentialPath = path.join(homeDir, 'custom-credential.txt');
+
+    fs.mkdirSync(piAgentDir, { recursive: true });
+    fs.mkdirSync(awsDir, { recursive: true });
+    fs.mkdirSync(gcloudDir, { recursive: true });
+    fs.writeFileSync(googleCredentialsPath, '{}', 'utf8');
+    fs.writeFileSync(customCredentialPath, 'secret', 'utf8');
+
+    process.env.HOME = homeDir;
+    process.env.PI_CODING_AGENT_DIR = piAgentDir;
+    process.env.OPENAI_API_KEY = 'host-openai-key';
+    process.env.COPILOT_GITHUB_TOKEN = 'host-copilot-token';
+    process.env.GH_TOKEN = 'host-gh-token';
+    process.env.GITHUB_TOKEN = 'host-github-token';
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = googleCredentialsPath;
+    process.env.CUSTOM_TOKEN = 'custom-token';
+    process.env.CUSTOM_CRED_FILE = customCredentialPath;
+
+    const args = buildContainerArgs({
+      ...baseOptions,
+      envVars: {
+        COVE_SESSION_ID: 'live-1',
+      },
+      providerEnvPassthrough: [{ name: 'CUSTOM_TOKEN' }],
+      providerFileEnvPassthrough: [{ name: 'CUSTOM_CRED_FILE', kind: 'file' }],
+    });
+
+    expect(args).toContain(`${piAgentDir}:/app/pi-agent-base:ro`);
+    expect(args).toContain(`${awsDir}:/root/.aws:ro`);
+    expect(args).toContain(`${gcloudDir}:/root/.config/gcloud:ro`);
+    expect(args).toContain(`${googleCredentialsPath}:/app/provider-paths/GOOGLE_APPLICATION_CREDENTIALS:ro`);
+    expect(args).toContain(`${customCredentialPath}:/app/provider-paths/CUSTOM_CRED_FILE:ro`);
+    expect(args).toContain('OPENAI_API_KEY=host-openai-key');
+    expect(args).toContain('COPILOT_GITHUB_TOKEN=host-copilot-token');
+    expect(args).toContain('GH_TOKEN=host-gh-token');
+    expect(args).toContain('GITHUB_TOKEN=host-github-token');
+    expect(args).toContain('GOOGLE_APPLICATION_CREDENTIALS=/app/provider-paths/GOOGLE_APPLICATION_CREDENTIALS');
+    expect(args).toContain('CUSTOM_TOKEN=custom-token');
+    expect(args).toContain('CUSTOM_CRED_FILE=/app/provider-paths/CUSTOM_CRED_FILE');
+    expect(args).toContain('PI_CODING_AGENT_DIR=/app/session/.pi-agent');
+    expect(args).toContain('HOME=/root');
+  });
+
+  it('buildContainerArgs throws when a required custom provider env passthrough is missing', () => {
+    delete process.env.CUSTOM_TOKEN;
+
+    expect(() => buildContainerArgs({
+      ...baseOptions,
+      providerEnvPassthrough: [{ name: 'CUSTOM_TOKEN' }],
+    })).toThrow('Missing required provider env passthrough: CUSTOM_TOKEN');
+  });
+
   it('spawnContainer stores effective allowlisted OneCLI gateway env on the tracked container entry', () => {
     const tmpDir = makeTempDir('cove-v2-manager-onecli-stored-env-');
     const runtimePath = path.join(tmpDir, 'fake-runtime.sh');
@@ -162,7 +241,8 @@ describe('container manager', () => {
     process.env.HTTPS_PROXY = 'https://proxy.example';
     process.env.ONECLI_AGENT_NAME = 'cove-agent';
     process.env.ONECLI_URL = 'https://onecli.example';
-    process.env.AWS_SECRET_ACCESS_KEY = 'should-not-leak';
+    process.env.AWS_SECRET_ACCESS_KEY = 'aws-secret';
+    process.env.UNRELATED_HOST_SECRET = 'should-not-leak';
 
     const ok = spawnContainer({
       imageName: 'cove-agent:latest',
@@ -174,12 +254,15 @@ describe('container manager', () => {
 
     expect(ok).toBe(true);
     expect(getActiveContainers().get('sess-onecli-stored-env')?.options.envVars).toEqual({
+      HOME: '/root',
+      PI_CODING_AGENT_DIR: '/app/session/.pi-agent',
+      AWS_SECRET_ACCESS_KEY: 'aws-secret',
       HTTPS_PROXY: 'https://proxy.example',
       ONECLI_AGENT_NAME: 'cove-agent',
       ONECLI_URL: 'https://onecli.example',
       COVE_SESSION_ID: 'sess-onecli-stored-env',
     });
-    expect(getActiveContainers().get('sess-onecli-stored-env')?.options.envVars).not.toHaveProperty('AWS_SECRET_ACCESS_KEY');
+    expect(getActiveContainers().get('sess-onecli-stored-env')?.options.envVars).not.toHaveProperty('UNRELATED_HOST_SECRET');
   });
 
   it('spawnContainer returns false when the runtime binary is unavailable', () => {

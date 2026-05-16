@@ -10,6 +10,10 @@ import {
   spawnContainer as defaultSpawnContainer,
   type ContainerStartOptions,
 } from '../container/spawn.ts';
+import {
+  parseRuntimePrepConfigValue,
+  type RuntimePrepConfig,
+} from '../runtime-prep-config.ts';
 import type { RoutedRequest, SessionConfig, WarmPool } from '../shared/types.ts';
 
 type EnsureSessionRuntimeOptions = {
@@ -32,6 +36,12 @@ type EnsureSessionRuntimeDeps = {
   killContainer?(sessionId: string, reason?: string): void;
 };
 
+function requiresColdSpawn(config: SessionConfig, runtimePrep: RuntimePrepConfig): boolean {
+  return config.workspace != null
+    || (runtimePrep.provider_env_passthrough?.length ?? 0) > 0
+    || (runtimePrep.provider_file_env_passthrough?.length ?? 0) > 0;
+}
+
 function injectPersonaIntoConfig(config: SessionConfig, agentGroupId: string, db: Database): SessionConfig {
   const explicitPersona = config.extra_env?.COVE_PERSONA;
   const persona = explicitPersona ?? loadPersona(agentGroupId, { db });
@@ -49,9 +59,24 @@ function injectPersonaIntoConfig(config: SessionConfig, agentGroupId: string, db
   };
 }
 
-function buildRuntimeEnv(config: SessionConfig, sessionId: string): Record<string, string> {
+function buildRuntimeIdentityEnv(options: {
+  agentGroupId: string;
+  centralDbPath?: string;
+}): Record<string, string> {
+  return {
+    COVE_AGENT_GROUP_ID: options.agentGroupId,
+    ...(options.centralDbPath == null ? {} : { COVE_CENTRAL_DB_PATH: options.centralDbPath }),
+  };
+}
+
+function buildRuntimeEnv(
+  config: SessionConfig,
+  sessionId: string,
+  identityEnv: Record<string, string>,
+): Record<string, string> {
   return {
     ...(config.extra_env ?? {}),
+    ...identityEnv,
     ...getAllowlistedOneCliGatewayEnv(),
     COVE_SESSION_ID: sessionId,
   };
@@ -61,12 +86,14 @@ function buildAdoptedRuntimeEnv(options: {
   warmSessionId: string;
   config: SessionConfig;
   liveSessionId: string;
+  identityEnv: Record<string, string>;
 }): Record<string, string> {
   const warmEnv = getActiveContainers().get(options.warmSessionId)?.options.envVars ?? {};
 
   return {
     ...warmEnv,
     ...(options.config.extra_env ?? {}),
+    ...options.identityEnv,
     ...getAllowlistedOneCliGatewayEnv(warmEnv),
     COVE_SESSION_ID: options.liveSessionId,
   };
@@ -75,6 +102,8 @@ function buildAdoptedRuntimeEnv(options: {
 function buildColdSpawnOptions(
   deps: EnsureSessionRuntimeDeps,
   options: EnsureSessionRuntimeOptions,
+  runtimePrep: RuntimePrepConfig,
+  identityEnv: Record<string, string>,
 ): ContainerStartOptions {
   return {
     imageName: deps.imageName,
@@ -83,7 +112,9 @@ function buildColdSpawnOptions(
     sessionDir: options.routed.session.session_file!,
     centralDbPath: deps.centralDbPath,
     workspaceDir: options.config.workspace ?? undefined,
-    envVars: buildRuntimeEnv(options.config, options.routed.session.id),
+    envVars: buildRuntimeEnv(options.config, options.routed.session.id, identityEnv),
+    ...(runtimePrep.provider_env_passthrough == null ? {} : { providerEnvPassthrough: runtimePrep.provider_env_passthrough }),
+    ...(runtimePrep.provider_file_env_passthrough == null ? {} : { providerFileEnvPassthrough: runtimePrep.provider_file_env_passthrough }),
   };
 }
 
@@ -96,9 +127,25 @@ export function createEnsureSessionRuntime(deps: EnsureSessionRuntimeDeps) {
   return async function ensureSessionRuntime(options: EnsureSessionRuntimeOptions): Promise<boolean> {
     const liveSessionId = options.routed.session.id;
     const resolvedConfig = injectPersonaIntoConfig(options.config, options.routed.agentGroup.id, deps.db);
+    const runtimePrep = parseRuntimePrepConfigValue(options.routed.agentGroup.config) ?? {};
+    const identityEnv = buildRuntimeIdentityEnv({
+      agentGroupId: options.routed.agentGroup.id,
+      centralDbPath: deps.centralDbPath,
+    });
 
     if (isContainerRunning(liveSessionId)) {
       return true;
+    }
+
+    if (requiresColdSpawn(resolvedConfig, runtimePrep)) {
+      if (options.routed.session.session_file == null) {
+        return false;
+      }
+
+      return spawnContainer(buildColdSpawnOptions(deps, {
+        ...options,
+        config: resolvedConfig,
+      }, runtimePrep, identityEnv));
     }
 
     const warmAllocation = await deps.warmPool.acquire();
@@ -113,6 +160,7 @@ export function createEnsureSessionRuntime(deps: EnsureSessionRuntimeDeps) {
           warmSessionId: warmAllocation.sessionId,
           config: resolvedConfig,
           liveSessionId,
+          identityEnv,
         }),
       });
 
@@ -150,6 +198,6 @@ export function createEnsureSessionRuntime(deps: EnsureSessionRuntimeDeps) {
     return spawnContainer(buildColdSpawnOptions(deps, {
       ...options,
       config: resolvedConfig,
-    }));
+    }, runtimePrep, identityEnv));
   };
 }

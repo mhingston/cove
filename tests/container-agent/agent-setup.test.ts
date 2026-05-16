@@ -80,11 +80,15 @@ describe('container agent setup', () => {
     });
   });
 
-  it('fails fast for unsupported or incomplete config', () => {
-    expect(() => resolveContainerAgentModel({
+  it('supports generic provider names while still rejecting incomplete auto config', () => {
+    expect(resolveContainerAgentModel({
       provider: 'openai',
       model: 'gpt-4.1',
-    })).toThrow("Unsupported container agent provider 'openai'.");
+    })).toEqual({
+      provider: 'openai',
+      model: 'gpt-4.1',
+      id: 'openai/gpt-4.1',
+    });
 
     expect(() => resolveContainerAgentModel({
       provider: 'auto',
