@@ -1936,7 +1936,11 @@ describe('container runner phase 5', () => {
     const deps: ContainerSessionDeps = {
       ...createFakeDeps({ capture: captured }),
       resolveInstalledPackageDir(packageName) {
-        return packageName === 'pi-mcp-adapter' ? `/tmp/node_modules/${packageName}` : undefined;
+        if (packageName === 'pi-lean-ctx' || packageName === 'pi-mcp-adapter') {
+          return `/tmp/node_modules/${packageName}`;
+        }
+
+        return undefined;
       },
     };
 
@@ -1967,7 +1971,10 @@ describe('container runner phase 5', () => {
     expect(captured.resourceLoaders).toContainEqual(expect.objectContaining({
       cwd: process.cwd(),
       agentDir: path.join(sessionDir, '.pi-agent'),
-      additionalExtensionPaths: ['/tmp/node_modules/pi-mcp-adapter'],
+      additionalExtensionPaths: [
+        '/tmp/node_modules/pi-lean-ctx',
+        '/tmp/node_modules/pi-mcp-adapter',
+      ],
       extensionFactories: expect.any(Array),
     }));
   });
@@ -1987,6 +1994,12 @@ describe('container runner phase 5', () => {
       promptedMessages: [] as string[],
       resourceLoaders: [] as Array<unknown>,
     };
+    const deps: ContainerSessionDeps = {
+      ...createFakeDeps({ capture: captured }),
+      resolveInstalledPackageDir(packageName) {
+        return packageName === 'pi-lean-ctx' ? `/tmp/node_modules/${packageName}` : undefined;
+      },
+    };
 
     await runContainerSession(
       {
@@ -1999,12 +2012,16 @@ describe('container runner phase 5', () => {
         },
       },
       undefined,
-      createFakeDeps({ capture: captured }),
+      deps,
     );
+
+    const mcpPath = path.join(sessionDir, '.pi-agent', 'mcp.json');
+    expect(fs.existsSync(mcpPath)).toBe(false);
 
     expect(captured.resourceLoaders).toContainEqual(expect.objectContaining({
       cwd: process.cwd(),
       agentDir: path.join(sessionDir, '.pi-agent'),
+      additionalExtensionPaths: ['/tmp/node_modules/pi-lean-ctx'],
       extensionFactories: expect.any(Array),
     }));
   });
@@ -2029,7 +2046,11 @@ describe('container runner phase 5', () => {
     const deps: ContainerSessionDeps = {
       ...createFakeDeps({ capture: captured }),
       resolveInstalledPackageDir(packageName) {
-        return packageName === 'pi-subagents' ? `/tmp/node_modules/${packageName}` : undefined;
+        if (packageName === 'pi-subagents' || packageName === 'pi-lean-ctx') {
+          return `/tmp/node_modules/${packageName}`;
+        }
+
+        return undefined;
       },
     };
 
@@ -2047,8 +2068,14 @@ describe('container runner phase 5', () => {
       deps,
     );
 
+    const mcpPath = path.join(sessionDir, '.pi-agent', 'mcp.json');
+    expect(fs.existsSync(mcpPath)).toBe(false);
+
     expect(captured.resourceLoaders).toContainEqual(expect.objectContaining({
-      additionalExtensionPaths: ['/tmp/node_modules/pi-subagents'],
+      additionalExtensionPaths: [
+        '/tmp/node_modules/pi-subagents',
+        '/tmp/node_modules/pi-lean-ctx',
+      ],
     }));
   });
 
@@ -2074,6 +2101,14 @@ describe('container runner phase 5', () => {
       'utf8',
     );
     fs.writeFileSync(path.join(projectDir, 'node_modules', 'pi-subagents', 'index.js'), 'export {};\n', 'utf8');
+
+    fs.mkdirSync(path.join(projectDir, 'node_modules', 'pi-lean-ctx'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projectDir, 'node_modules', 'pi-lean-ctx', 'package.json'),
+      JSON.stringify({ name: 'pi-lean-ctx', type: 'module' }),
+      'utf8',
+    );
+    fs.writeFileSync(path.join(projectDir, 'node_modules', 'pi-lean-ctx', 'index.js'), 'export {};\n', 'utf8');
 
     mock.module('@mariozechner/pi-coding-agent', () => ({
       AuthStorage: {
@@ -2164,13 +2199,114 @@ describe('container runner phase 5', () => {
       process.chdir(originalCwd);
     }
 
+    const mcpPath = path.join(sessionDir, '.pi-agent', 'mcp.json');
+    expect(JSON.parse(fs.readFileSync(mcpPath, 'utf8'))).toEqual({
+      mcpServers: {
+        github: {
+          command: 'npx',
+          args: ['-y', '@modelcontextprotocol/server-github'],
+        },
+      },
+    });
+
     expect(resourceLoaders).toContainEqual(expect.objectContaining({
       agentDir: path.join(sessionDir, '.pi-agent'),
       additionalExtensionPaths: [
         fs.realpathSync(path.join(projectDir, 'node_modules', 'pi-subagents')),
+        fs.realpathSync(path.join(projectDir, 'node_modules', 'pi-lean-ctx')),
         fs.realpathSync(path.join(projectDir, 'node_modules', 'pi-mcp-adapter')),
       ],
     }));
+  });
+
+  it('excludes missing pi-lean-ctx from partial extension sets and records a runner warning', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-partial-extension-set-');
+    const sessionId = 'sess-partial-extension-set-1';
+    const warningMessages: string[] = [];
+    const originalError = console.error;
+    const originalStatSync = fs.statSync;
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      api_key: 'runner-api-key',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: 'group-partial-extension-set',
+        COVE_MCP_CONFIG: JSON.stringify({
+          mcpServers: {
+            github: {
+              command: 'npx',
+              args: ['-y', '@modelcontextprotocol/server-github'],
+            },
+          },
+        }),
+      },
+    });
+    writeUserMessage(sessionDir, 'Use partial extension set');
+
+    const captured = {
+      promptedMessages: [] as string[],
+      resourceLoaders: [] as Array<unknown>,
+    };
+    const deps: ContainerSessionDeps = {
+      ...createFakeDeps({ capture: captured }),
+      resolveInstalledPackageDir(packageName) {
+        if (packageName === 'pi-subagents' || packageName === 'pi-mcp-adapter') {
+          return `/tmp/node_modules/${packageName}`;
+        }
+
+        return undefined;
+      },
+    };
+
+    console.error = ((...args: unknown[]) => {
+      warningMessages.push(args.map((arg) => String(arg)).join(' '));
+    }) as typeof console.error;
+    // Force the missing-package fallback even if pi-lean-ctx is installed locally.
+    fs.statSync = ((candidate: fs.PathLike, options?: fs.StatOptions & { bigint?: false; throwIfNoEntry: false }) => {
+      if (String(candidate).endsWith(`${path.sep}pi-lean-ctx`)) {
+        throw new Error('ENOENT');
+      }
+
+      return originalStatSync(candidate, options);
+    }) as typeof fs.statSync;
+
+    try {
+      await runContainerSession(
+        {
+          inboundPath: path.join(sessionDir, 'inbound.db'),
+          outboundPath: path.join(sessionDir, 'outbound.db'),
+          sessionId,
+          config: {
+            provider: 'anthropic',
+            model: 'claude-runner',
+          },
+        },
+        undefined,
+        deps,
+      );
+    } finally {
+      console.error = originalError;
+      fs.statSync = originalStatSync;
+    }
+
+    const mcpPath = path.join(sessionDir, '.pi-agent', 'mcp.json');
+    expect(JSON.parse(fs.readFileSync(mcpPath, 'utf8'))).toEqual({
+      mcpServers: {
+        github: {
+          command: 'npx',
+          args: ['-y', '@modelcontextprotocol/server-github'],
+        },
+      },
+    });
+
+    expect(captured.resourceLoaders).toContainEqual(expect.objectContaining({
+      additionalExtensionPaths: [
+        '/tmp/node_modules/pi-subagents',
+        '/tmp/node_modules/pi-mcp-adapter',
+      ],
+    }));
+    expect(warningMessages).toContainEqual(expect.stringContaining('pi-lean-ctx'));
   });
 
   it('fails startup when the materialized inherited extension set is unsupported', async () => {
@@ -2657,12 +2793,95 @@ describe('container runner phase 5', () => {
       },
     }, undefined, {
       resolveInstalledPackageDir(packageName) {
-        return packageName === 'pi-onecli-extension' ? `/tmp/node_modules/${packageName}` : undefined;
+        if (packageName === 'pi-lean-ctx' || packageName === 'pi-onecli-extension') {
+          return `/tmp/node_modules/${packageName}`;
+        }
+
+        return undefined;
       },
     });
 
     expect(resourceLoaders).toContainEqual(expect.objectContaining({
-      additionalExtensionPaths: ['/tmp/node_modules/pi-onecli-extension'],
+      additionalExtensionPaths: [
+        '/tmp/node_modules/pi-lean-ctx',
+        '/tmp/node_modules/pi-onecli-extension',
+      ],
+    }));
+  });
+
+  it('adds pi-subagents, pi-lean-ctx, pi-mcp-adapter, and pi-onecli-extension in order for inherited OneCLI gateway runs with agent groups and MCP config', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-onecli-extension-with-subagents-and-mcp-');
+    const sessionId = 'sess-onecli-extension-with-subagents-and-mcp-1';
+    const captured = {
+      promptedMessages: [] as string[],
+      resourceLoaders: [] as Array<unknown>,
+    };
+
+    process.env.ONECLI_AGENT_NAME = 'cove-agent';
+    process.env.ONECLI_URL = 'https://onecli.example';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      extra_env: {
+        COVE_AGENT_GROUP_ID: 'group-onecli-extension-with-subagents-and-mcp',
+        COVE_MCP_CONFIG: JSON.stringify({
+          mcpServers: {
+            github: {
+              command: 'npx',
+              args: ['-y', '@modelcontextprotocol/server-github'],
+            },
+          },
+        }),
+      },
+    });
+    writeUserMessage(sessionDir, 'Use inherited OneCLI auth with MCP and subagents.');
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      {
+        ...createFakeDeps({ capture: captured }),
+        resolveInstalledPackageDir(packageName) {
+          if (
+            packageName === 'pi-subagents'
+            || packageName === 'pi-lean-ctx'
+            || packageName === 'pi-mcp-adapter'
+            || packageName === 'pi-onecli-extension'
+          ) {
+            return `/tmp/node_modules/${packageName}`;
+          }
+
+          return undefined;
+        },
+      },
+    );
+
+    const mcpPath = path.join(sessionDir, '.pi-agent', 'mcp.json');
+    expect(JSON.parse(fs.readFileSync(mcpPath, 'utf8'))).toEqual({
+      mcpServers: {
+        github: {
+          command: 'npx',
+          args: ['-y', '@modelcontextprotocol/server-github'],
+        },
+      },
+    });
+
+    expect(captured.resourceLoaders).toContainEqual(expect.objectContaining({
+      additionalExtensionPaths: [
+        '/tmp/node_modules/pi-subagents',
+        '/tmp/node_modules/pi-lean-ctx',
+        '/tmp/node_modules/pi-mcp-adapter',
+        '/tmp/node_modules/pi-onecli-extension',
+      ],
     }));
   });
 

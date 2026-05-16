@@ -449,6 +449,18 @@ function prepareSessionOverlayAgentDir(config: SessionConfig, sessionStateDir: s
   return { agentDir, packageDir };
 }
 
+function resolveDefaultLeanCtxExtensionPackageDir(resolvePackageDir: (packageName: string) => string | undefined): string | undefined {
+  const packageDir = resolvePackageDir('pi-lean-ctx');
+
+  if (packageDir == null) {
+    // pi-lean-ctx is the default extension layer, so we keep an explicit runner
+    // warning when it is missing; the other Pi extensions are session-specific.
+    console.error('[runner] pi-lean-ctx could not be resolved; defaulting to built-in Pi tools for this session');
+  }
+
+  return packageDir;
+}
+
 function resolvePiSessionDir(sessionStateDir: string): string {
   return path.join(sessionStateDir, '.pi-agent', 'sessions');
 }
@@ -1319,11 +1331,12 @@ function buildResourceLoader(options: {
   const agentGroupId = getAgentGroupId(options.config);
   const sessionOverlayAgentDir = prepareSessionOverlayAgentDir(options.config, options.sessionStateDir, options.resolveInstalledPackageDir);
   const subagentPackageDir = agentGroupId == null ? undefined : options.resolveInstalledPackageDir('pi-subagents');
+  const leanCtxExtensionPackageDir = resolveDefaultLeanCtxExtensionPackageDir(options.resolveInstalledPackageDir);
   const gatewayAuth = getGatewayAuthState(options.config);
   const oneCliExtensionPackageDir = gatewayAuth.isEnabled && gatewayAuth.isSupported && gatewayAuth.hasInheritedGatewayEnv
     ? options.resolveInstalledPackageDir('pi-onecli-extension')
     : undefined;
-  const additionalExtensionPaths = [subagentPackageDir, sessionOverlayAgentDir.packageDir, oneCliExtensionPackageDir]
+  const additionalExtensionPaths = [subagentPackageDir, leanCtxExtensionPackageDir, sessionOverlayAgentDir.packageDir, oneCliExtensionPackageDir]
     .filter((value): value is string => value != null);
   const persona = agentGroupId == null || centralDbPath == null
     ? undefined

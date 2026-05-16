@@ -272,9 +272,9 @@ OneCLI integration:
 
 ## lean-ctx Integration
 
-[lean-ctx](https://leanctx.com) is pre-installed in the Cove agent container image. It reduces token consumption by up to 99% through compressed shell output and 58 MCP tools (`ctx_read`, `ctx_shell`, `ctx_search`, `ctx_tree`) that replace native file reads and shell calls with cache-aware, token-efficient equivalents.
+[lean-ctx](https://leanctx.com) is pre-installed in the Cove agent container image. Cove also loads `pi-lean-ctx` by default, so standard Pi sessions get the default `ctx_*` tooling without adding anything to `config.mcpServers`.
 
-To enable lean-ctx for an agent group, include it in the `config.mcpServers` field when creating or updating the group:
+If you want the advanced MCP-backed lean-ctx path instead, include it in the `config.mcpServers` field when creating or updating the group:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:4111/v1/agent-groups \
@@ -294,7 +294,7 @@ curl -sS -X POST http://127.0.0.1:4111/v1/agent-groups \
   }'
 ```
 
-Cove serializes `mcpServers` into the session's `mcp.json` so Pi picks it up automatically at session start. No other configuration is needed — `lean-ctx` (no arguments) starts the MCP server over stdio, which is the standard MCP transport.
+Cove serializes explicit `mcpServers` entries into the session's `mcp.json` and loads `pi-mcp-adapter` so Pi picks them up automatically at session start. Use this path when you need explicit, session-local MCP-backed lean-ctx configuration instead of the default CLI-first `pi-lean-ctx` behavior. `lean-ctx` (no arguments) starts the MCP server over stdio, which is the standard MCP transport.
 
 Shell compression hooks are also available for interactive bash sessions inside containers (`lean-ctx-on` / `lean-ctx-off`).
 
