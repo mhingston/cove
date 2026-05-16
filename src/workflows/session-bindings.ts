@@ -1,21 +1,21 @@
 import type { Database } from 'bun:sqlite';
-import type { AgentMessage, AgentToolResult } from '@mariozechner/pi-agent-core';
+import type { AgentMessage } from '@mariozechner/pi-agent-core';
 
-import { getNextOutboundSeq, openExistingOutboundDb, openOutboundDb, readProcessingAck, writeOutboundMessage, writeProcessingAck } from '../session/outbound.ts';
+import { pollForWorkflowActionResult as pollForWorkflowActionResultDefault } from '../delivery.ts';
+import { getNextOutboundSeq, openOutboundDb, readProcessingAck, writeOutboundMessage, writeProcessingAck } from '../session/outbound.ts';
+import { openExistingOutboundDb } from '../session/outbound.ts';
 import { openInboundDb, writeInboundMessage } from '../session/inbound.ts';
 import { ensureSessionForRuntime } from '../session/manager.ts';
 import { buildAgentGroupSessionConfig } from '../session-config.ts';
 import { routeRequest } from '../router.ts';
-import { pollForResponse as defaultPollForResponse } from '../delivery.ts';
-import type { ChatHandlerContext, ChatMessage, SessionConfig } from '../shared/types.ts';
+import type {
+  ChatHandlerContext,
+  SessionConfig,
+  WorkflowActionRequestMetadata,
+  WorkflowActionResultMetadata,
+} from '../shared/types.ts';
 import type { AgentGroupRow, RoutedRequest, SessionRow } from '../shared/types.ts';
-import {
-  executeHostLlmPrompt,
-  executeHostSessionPrompt,
-  executeHostToolCall,
-  prepareHostSession,
-  type ContainerSessionDeps,
-} from '../container-agent/runner.ts';
+import type { ContainerSessionDeps } from '../container-agent/runner.ts';
 import type { WorkflowExecutionContext } from './bridge.ts';
 
 function resolveHostCentralDbPath(db: Database): string | undefined {
@@ -37,43 +37,6 @@ function stripTimestamps<T>(value: T): T {
 
     return candidate;
   })) as T;
-}
-
-function extractTextContent(result: unknown): string {
-  if (typeof result === 'string') {
-    return result;
-  }
-
-  if (!Array.isArray(result)) {
-    return '';
-  }
-
-  return result
-    .map((part) => {
-      if (part != null && typeof part === 'object' && 'type' in part && 'text' in part && part.type === 'text' && typeof part.text === 'string') {
-        return part.text;
-      }
-
-      return '';
-    })
-    .join('');
-}
-
-function decodeToolResult(result: AgentToolResult<unknown>): unknown {
-  const text = extractTextContent(result.content);
-
-  if (text.trim() !== '') {
-    try {
-      return JSON.parse(text);
-    } catch {
-      return text;
-    }
-  }
-
-  return {
-    details: result.details,
-    ...(result.terminate === undefined ? {} : { terminate: result.terminate }),
-  };
 }
 
 function buildWorkflowSessionConfig(options: {
@@ -189,78 +152,18 @@ export function createWorkflowSessionBindings(options: {
   stateDir: string;
   ensureSessionRuntime?: NonNullable<ChatHandlerContext['ensureSessionRuntime']>;
   pollForResponse?: NonNullable<ChatHandlerContext['pollForResponse']>;
+  pollForWorkflowActionResult?: NonNullable<ChatHandlerContext['pollForWorkflowActionResult']>;
   runnerDeps?: ContainerSessionDeps;
   createCoveTools?: ContainerSessionDeps['createCoveTools'];
 }) {
-  const pollForResponse = options.pollForResponse ?? defaultPollForResponse;
+  void options.pollForResponse;
+  void options.runnerDeps;
+  void options.createCoveTools;
 
-  async function promptWithRouting(args: {
-    routed: RoutedRequest;
-    messages: ChatMessage[];
-    modelOverride?: string;
-  }): Promise<string> {
-    const config = buildWorkflowSessionConfig({
-      db: options.db,
-      routed: args.routed,
-      modelOverride: args.modelOverride,
-    });
-
-    if (options.ensureSessionRuntime != null) {
-      const ready = await options.ensureSessionRuntime({ routed: args.routed, config });
-
-      if (!ready) {
-        throw new Error('Container runtime unavailable');
-      }
-    }
-
-    const sessionDir = args.routed.session.session_file;
-    if (sessionDir == null) {
-      throw new Error('Session runtime is unavailable');
-    }
-
-    const outboundBaselineDb = openExistingOutboundDb(sessionDir);
-    let baselineOutSeq = 0;
-
-    try {
-      const row = outboundBaselineDb.prepare('SELECT MAX(seq) AS seq FROM messages_out').get() as { seq: number | null };
-      baselineOutSeq = row.seq ?? 0;
-    } finally {
-      outboundBaselineDb.close();
-    }
-
-    const inboundDb = openInboundDb(sessionDir);
-
-    try {
-      writeSessionConfig(inboundDb, config);
-      for (const message of args.messages) {
-        if (message.role !== 'user') {
-          continue;
-        }
-
-        writeInboundMessage(inboundDb, {
-          id: crypto.randomUUID(),
-          role: message.role,
-          content: message.content,
-        });
-      }
-    } finally {
-      inboundDb.close();
-    }
-
-    const messages = await pollForResponse({
-      openDb: () => openExistingOutboundDb(sessionDir),
-      sessionId: args.routed.session.id,
-      baselineOutSeq,
-    });
-
-    return messages.map((message) => message.content).join('');
-  }
-
-  async function prepareWorkflowHostSession(args: {
+  async function prepareWorkflowSession(args: {
     context: WorkflowExecutionContext;
     modelOverride?: string;
-    noSkills?: boolean;
-  }) {
+  }): Promise<{ routed: RoutedRequest; config: SessionConfig; sessionDir: string }> {
     const routed = resolveWorkflowRouting({
       db: options.db,
       stateDir: options.stateDir,
@@ -280,65 +183,183 @@ export function createWorkflowSessionBindings(options: {
       }
     }
 
-    const sessionStateDir = routed.session.session_file;
-    if (sessionStateDir == null) {
+    const sessionDir = routed.session.session_file;
+    if (sessionDir == null) {
       throw new Error('Session runtime is unavailable');
     }
 
-    return await prepareHostSession({
-      config,
-      sessionId: routed.session.id,
-      sessionStateDir,
-      noSkills: args.noSkills,
-      deps: {
-        ...(options.runnerDeps ?? {}),
-        ...(options.createCoveTools == null ? {} : { createCoveTools: options.createCoveTools }),
-      },
+    return { routed, config, sessionDir };
+  }
+
+  async function executeWorkflowAction(args: {
+    context: WorkflowExecutionContext;
+    modelOverride?: string;
+    content: string;
+    metadata: WorkflowActionRequestMetadata;
+  }): Promise<WorkflowActionResultMetadata> {
+    const prepared = await prepareWorkflowSession({
+      context: args.context,
+      modelOverride: args.modelOverride,
     });
+
+    const outboundBaselineDb = openExistingOutboundDb(prepared.sessionDir);
+    let baselineOutSeq = 0;
+
+    try {
+      const baselineRow = outboundBaselineDb.prepare('SELECT MAX(seq) AS seq FROM messages_out').get() as {
+        seq: number | null;
+      };
+      baselineOutSeq = baselineRow.seq ?? 0;
+    } finally {
+      outboundBaselineDb.close();
+    }
+
+    const pollForWorkflowActionResult = options.pollForWorkflowActionResult ?? pollForWorkflowActionResultDefault;
+
+    const inboundDb = openInboundDb(prepared.sessionDir);
+
+    try {
+      writeSessionConfig(inboundDb, prepared.config);
+      writeInboundMessage(inboundDb, {
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: args.content,
+        metadata: args.metadata,
+      });
+    } finally {
+      inboundDb.close();
+    }
+
+    const result = await pollForWorkflowActionResult({
+      openDb: () => openExistingOutboundDb(prepared.sessionDir),
+      sessionId: prepared.routed.session.id,
+      baselineOutSeq,
+      requestId: args.metadata.request_id,
+    });
+
+    if (result.request_id !== args.metadata.request_id || result.action !== args.metadata.action) {
+      throw new Error('Workflow action result did not match the requested action');
+    }
+
+    return result;
+  }
+
+  function assertWorkflowActionNotBlocked(args: {
+    result: WorkflowActionResultMetadata;
+    action: 'prompt' | 'llm' | 'skill';
+    name?: string;
+  }): void {
+    if (args.result.status !== 'blocked') {
+      return;
+    }
+
+    if (args.action === 'skill' && args.name != null) {
+      throw new Error(`Workflow skill action was blocked: ${args.name}`);
+    }
+
+    if (args.action === 'llm') {
+      throw new Error('Workflow LLM action was blocked');
+    }
+
+    throw new Error(`Workflow ${args.action} action was blocked`);
   }
 
   return {
     async llm(context: WorkflowExecutionContext, messages: unknown[], llmOptions?: { model?: string; tools?: unknown[] }): Promise<unknown> {
-      const prepared = await prepareWorkflowHostSession({
+      void llmOptions?.tools;
+
+      const result = await executeWorkflowAction({
         context,
         modelOverride: llmOptions?.model,
-        noSkills: true,
+        content: '',
+        metadata: {
+          type: 'workflow_action',
+          request_id: crypto.randomUUID(),
+          action: 'llm',
+          messages: stripTimestamps(messages) as AgentMessage[],
+        },
       });
-      const response = await executeHostLlmPrompt(prepared, stripTimestamps(messages) as AgentMessage[]);
 
-      return stripTimestamps(response);
+      if (result.status === 'error') {
+        throw new Error(result.error?.message ?? 'Workflow LLM action failed');
+      }
+
+      assertWorkflowActionNotBlocked({ result, action: 'llm' });
+
+      return stripTimestamps(result.result);
     },
     async tool(context: WorkflowExecutionContext, name: string, args: unknown): Promise<unknown> {
       if (args == null || typeof args !== 'object' || Array.isArray(args)) {
         throw new Error(`Tool ${name} requires object arguments`);
       }
 
-      const prepared = await prepareWorkflowHostSession({
+      const result = await executeWorkflowAction({
         context,
-        noSkills: true,
+        content: '',
+        metadata: {
+          type: 'workflow_action',
+          request_id: crypto.randomUUID(),
+          action: 'tool',
+          name,
+          args: args as Record<string, unknown>,
+        },
       });
-      const result = await executeHostToolCall(prepared, name, args as Record<string, unknown>);
 
-      return decodeToolResult(result);
+      if (result.status === 'error') {
+        throw new Error(result.error?.message ?? `Workflow tool action failed: ${name}`);
+      }
+
+      return result.result;
     },
     async skill(context: WorkflowExecutionContext, name: string, input: string): Promise<string> {
-      const prepared = await prepareWorkflowHostSession({
+      const result = await executeWorkflowAction({
         context,
-        noSkills: false,
+        content: '',
+        metadata: {
+          type: 'workflow_action',
+          request_id: crypto.randomUUID(),
+          action: 'skill',
+          name,
+          input,
+        },
       });
 
-      return await executeHostSessionPrompt(prepared, `/skill:${name} ${input}`.trim());
+      if (result.status === 'error') {
+        throw new Error(result.error?.message ?? `Workflow skill action failed: ${name}`);
+      }
+
+      assertWorkflowActionNotBlocked({ result, action: 'skill', name });
+
+      if (typeof result.result !== 'string') {
+        throw new Error(`Workflow skill action returned non-string result: ${name}`);
+      }
+
+      return result.result;
     },
     async prompt(context: WorkflowExecutionContext, prompt: string, promptOptions?: { model?: string }): Promise<string> {
-      return await promptWithRouting({
-        routed: resolveWorkflowRouting({
-          db: options.db,
-          stateDir: options.stateDir,
-          context,
-        }),
-        messages: [{ role: 'user', content: prompt }],
+      const result = await executeWorkflowAction({
+        context,
         modelOverride: promptOptions?.model,
+        content: prompt,
+        metadata: {
+          type: 'workflow_action',
+          request_id: crypto.randomUUID(),
+          action: 'prompt',
+          prompt,
+        },
       });
+
+      if (result.status === 'error') {
+        throw new Error(result.error?.message ?? 'Workflow prompt action failed');
+      }
+
+      assertWorkflowActionNotBlocked({ result, action: 'prompt' });
+
+      if (typeof result.result !== 'string') {
+        throw new Error('Workflow prompt action returned non-string result');
+      }
+
+      return result.result;
     },
     async sendMessage(context: WorkflowExecutionContext, content: string): Promise<void> {
       const routed = resolveWorkflowRouting({

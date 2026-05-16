@@ -1,4 +1,5 @@
 import type { Database } from 'bun:sqlite';
+import type { AgentMessage } from '@mariozechner/pi-agent-core';
 import type { ScheduleRecord } from '../jobs/schedules.ts';
 import type { WorkflowService } from '../workflows/bridge.ts';
 
@@ -147,6 +148,43 @@ export type DeliveryDbReader =
   | { db: Database }
   | { openDb: () => Database };
 
+export type WorkflowActionRequestMetadata =
+  | {
+      type: 'workflow_action';
+      request_id: string;
+      action: 'prompt';
+      prompt: string;
+    }
+  | {
+      type: 'workflow_action';
+      request_id: string;
+      action: 'tool';
+      name: string;
+      args: Record<string, unknown>;
+    }
+  | {
+      type: 'workflow_action';
+      request_id: string;
+      action: 'llm';
+      messages: AgentMessage[];
+    }
+  | {
+      type: 'workflow_action';
+      request_id: string;
+      action: 'skill';
+      name: string;
+      input: string;
+    };
+
+export type WorkflowActionResultMetadata = {
+  type: 'workflow_action_result';
+  request_id: string;
+  action: 'prompt' | 'tool' | 'llm' | 'skill';
+  status: 'completed' | 'blocked' | 'error';
+  result?: unknown;
+  error?: { message: string };
+};
+
 export type ChatHandlerContext = {
   routeRequest?(options: {
     db: Database;
@@ -162,6 +200,15 @@ export type ChatHandlerContext = {
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
   }): Promise<OutboundMessageRow[]>;
+  pollForWorkflowActionResult?(options: {
+    sessionId: string;
+    baselineOutSeq?: number;
+    requestId: string;
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  } & DeliveryDbReader): Promise<WorkflowActionResultMetadata>;
   ensureSessionRuntime?(options: {
     routed: RoutedRequest;
     config: SessionConfig;

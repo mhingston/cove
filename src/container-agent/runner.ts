@@ -11,7 +11,7 @@ import { PolicyEngine } from '../control/policy.ts';
 import { assembleContext } from '../context/assembly.ts';
 import { loadPersona } from '../context/persona.ts';
 import { parseRuntimeMcpConfig } from '../integrations/mcp.ts';
-import type { ChatMessage, SessionConfig } from '../shared/types.ts';
+import type { ChatMessage, SessionConfig, WorkflowActionRequestMetadata, WorkflowActionResultMetadata } from '../shared/types.ts';
 import { openExistingInboundDb } from '../session/inbound.ts';
 import {
   getNextOutboundSeq,
@@ -580,6 +580,233 @@ function blockedToolResultText(result: BlockedToolResult | undefined): string | 
   return result.permission === 'confirm' ? result.message : result.question;
 }
 
+function toolResultText(result: AgentToolResult<unknown>): string {
+  return Array.isArray(result.content)
+    ? result.content
+        .map((part) => part != null && typeof part === 'object' && 'text' in part && typeof (part as { text: unknown }).text === 'string'
+          ? (part as { text: string }).text
+          : '')
+        .join('')
+    : '';
+}
+
+function parseWorkflowActionMetadata(metadata: unknown): WorkflowActionRequestMetadata | undefined {
+  const record = parseJsonRecord(metadata);
+
+  if (record?.type !== 'workflow_action') {
+    return undefined;
+  }
+
+  if (typeof record.request_id !== 'string' || record.request_id.trim() === '') {
+    throw new Error('Malformed workflow action metadata: request_id is required');
+  }
+
+  if (record.action === 'prompt') {
+    if (typeof record.prompt !== 'string') {
+      throw new Error('Malformed workflow action metadata: prompt is required');
+    }
+
+    return {
+      type: 'workflow_action',
+      request_id: record.request_id,
+      action: 'prompt',
+      prompt: record.prompt,
+    };
+  }
+
+  if (record.action === 'tool') {
+    if (typeof record.name !== 'string' || record.name.trim() === '') {
+      throw new Error('Malformed workflow action metadata: tool name is required');
+    }
+
+    if (record.args == null || typeof record.args !== 'object' || Array.isArray(record.args)) {
+      throw new Error('Malformed workflow action metadata: tool args must be an object');
+    }
+
+    return {
+      type: 'workflow_action',
+      request_id: record.request_id,
+      action: 'tool',
+      name: record.name,
+      args: record.args as Record<string, unknown>,
+    };
+  }
+
+  if (record.action === 'llm') {
+    if (!Array.isArray(record.messages) || !record.messages.every((message) => {
+      if (message == null || typeof message !== 'object' || Array.isArray(message)) {
+        return false;
+      }
+
+      const candidate = message as { role?: unknown; content?: unknown };
+      return typeof candidate.role === 'string'
+        && 'content' in candidate
+        && (typeof candidate.content === 'string' || Array.isArray(candidate.content));
+    })) {
+      throw new Error('Malformed workflow action metadata: llm messages must be an array of message objects');
+    }
+
+    return {
+      type: 'workflow_action',
+      request_id: record.request_id,
+      action: 'llm',
+      messages: record.messages as AgentMessage[],
+    };
+  }
+
+  if (record.action === 'skill') {
+    if (typeof record.name !== 'string' || record.name.trim() === '') {
+      throw new Error('Malformed workflow action metadata: skill name is required');
+    }
+
+    if (typeof record.input !== 'string') {
+      throw new Error('Malformed workflow action metadata: skill input is required');
+    }
+
+    return {
+      type: 'workflow_action',
+      request_id: record.request_id,
+      action: 'skill',
+      name: record.name,
+      input: record.input,
+    };
+  }
+
+  throw new Error('Malformed workflow action metadata: unsupported action');
+}
+
+function blockedWorkflowActionError(action: 'prompt' | 'llm' | 'skill', skillName?: string): Error {
+  if (action === 'skill' && skillName != null) {
+    return new Error(`Workflow skill action was blocked: ${skillName}`);
+  }
+
+  if (action === 'llm') {
+    return new Error('Workflow LLM action was blocked');
+  }
+
+  return new Error(`Workflow ${action} action was blocked`);
+}
+
+function normalizeWorkflowActionResult(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return value;
+  }
+}
+
+async function executeWorkflowAction(prepared: PreparedHostSession, request: WorkflowActionRequestMetadata, blockedToolResult: () => BlockedToolResult | undefined): Promise<{
+  content: string;
+  metadata: WorkflowActionResultMetadata;
+}> {
+  try {
+    if (request.action === 'prompt') {
+      const result = await executeHostSessionPrompt(prepared, request.prompt);
+
+      if (blockedToolResult() != null) {
+        throw blockedWorkflowActionError('prompt');
+      }
+
+      return {
+        content: result,
+        metadata: {
+          type: 'workflow_action_result',
+          request_id: request.request_id,
+          action: 'prompt',
+          status: 'completed',
+          result,
+        },
+      };
+    }
+
+    if (request.action === 'skill') {
+      const command = request.input === '' ? `/skill:${request.name}` : `/skill:${request.name} ${request.input}`;
+      const result = await executeHostSessionPrompt(prepared, command);
+
+      if (blockedToolResult() != null) {
+        throw blockedWorkflowActionError('skill', request.name);
+      }
+
+      return {
+        content: result,
+        metadata: {
+          type: 'workflow_action_result',
+          request_id: request.request_id,
+          action: 'skill',
+          status: 'completed',
+          result,
+        },
+      };
+    }
+
+    if (request.action === 'llm') {
+      const result = await executeHostLlmPrompt(prepared, request.messages).catch((error) => {
+        if (blockedToolResult() != null) {
+          throw blockedWorkflowActionError('llm');
+        }
+
+        throw error;
+      });
+
+      if (blockedToolResult() != null) {
+        throw blockedWorkflowActionError('llm');
+      }
+
+      return {
+        content: toText(result.content),
+        metadata: {
+          type: 'workflow_action_result',
+          request_id: request.request_id,
+          action: 'llm',
+          status: 'completed',
+          result,
+        },
+      };
+    }
+
+    const result = await executeHostToolCall(prepared, request.name, request.args);
+    const blocked = blockedToolResult();
+    const content = blockedToolResultText(blocked) ?? toolResultText(result);
+
+    if (blocked != null) {
+      return {
+        content,
+        metadata: {
+          type: 'workflow_action_result',
+          request_id: request.request_id,
+          action: 'tool',
+          status: 'blocked',
+          result: blocked,
+        },
+      };
+    }
+
+    return {
+      content,
+      metadata: {
+        type: 'workflow_action_result',
+        request_id: request.request_id,
+        action: 'tool',
+        status: 'completed',
+        result: normalizeWorkflowActionResult(content),
+      },
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+
+    return {
+      content: message,
+      metadata: {
+        type: 'workflow_action_result',
+        request_id: request.request_id,
+        action: request.action,
+        status: 'error',
+        error: { message },
+      },
+    };
+  }
+}
+
 function resolveSessionResponseText(session: RunnerSessionResult['session'], tokens: string[]): string {
   const streamedText = tokens.join('');
 
@@ -801,11 +1028,13 @@ export async function executeHostToolCall(prepared: PreparedHostSession, toolNam
 
   let result: AgentToolResult<unknown>;
   let isError = false;
+  let executionError: Error | undefined;
 
   try {
     result = await (tool as AgentTool).execute(toolCall.id, validatedArgs, undefined, undefined);
   } catch (error) {
-    result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+    executionError = error instanceof Error ? error : new Error(String(error));
+    result = createErrorToolResult(executionError.message);
     isError = true;
   }
 
@@ -817,15 +1046,19 @@ export async function executeHostToolCall(prepared: PreparedHostSession, toolNam
     isError,
     context,
   });
-  if (afterResult == null) {
-    return result;
+  const finalResult = afterResult == null
+    ? result
+    : {
+      content: afterResult.content ?? result.content,
+      details: afterResult.details ?? result.details,
+      terminate: afterResult.terminate ?? result.terminate,
+    };
+
+  if (executionError != null) {
+    throw new Error(toolResultText(finalResult) || executionError.message);
   }
 
-  return {
-    content: afterResult.content ?? result.content,
-    details: afterResult.details ?? result.details,
-    terminate: afterResult.terminate ?? result.terminate,
-  };
+  return finalResult;
 }
 
 export async function executeHostLlmPrompt(prepared: PreparedHostSession, messages: AgentMessage[]): Promise<AssistantMessage> {
@@ -1303,10 +1536,11 @@ export async function runContainerSession(
     let lastResponse = '';
 
     for (const message of messages) {
+      const workflowAction = parseWorkflowActionMetadata(message.metadata);
       const persistedConfigForMessage = readSessionConfig(inboundDb);
       const effectiveConfigForMessage = mergeSessionConfig(options.config, persistedConfigForMessage);
       const customTools = resolveCustomTools(createCustomTools, effectiveConfigForMessage, sessionId);
-      const approvalResume = parseApprovalResumeMetadata(message.metadata);
+      const approvalResume = workflowAction == null ? parseApprovalResumeMetadata(message.metadata) : undefined;
       let blockedToolResult: BlockedToolResult | undefined;
       const resourceLoader = buildResourceLoader({
         config: effectiveConfigForMessage,
@@ -1331,35 +1565,55 @@ export async function runContainerSession(
       ).session;
 
       const tokens: string[] = [];
-      const unsubscribe = currentSession.subscribe((event) => {
-        if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'text_delta') {
-          tokens.push(event.assistantMessageEvent.delta);
-          onToken?.(event.assistantMessageEvent.delta);
-        }
-      });
+      const unsubscribe = workflowAction == null
+        ? currentSession.subscribe((event) => {
+            if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'text_delta') {
+              tokens.push(event.assistantMessageEvent.delta);
+              onToken?.(event.assistantMessageEvent.delta);
+            }
+          })
+        : () => {};
       const promptStartedAt = Date.now();
+      let response = '';
+      let outboundMetadata: Record<string, unknown> | undefined;
 
       console.error(`[runner] prompt-start session=${sessionId} seq=${message.seq}`);
 
       try {
-        await currentSession.prompt(message.content);
+        if (workflowAction == null) {
+          await currentSession.prompt(message.content);
+        } else {
+          const workflowResult = await executeWorkflowAction({
+            session: currentSession,
+            config: effectiveConfigForMessage,
+            sessionId,
+            sessionStateDir,
+            resourceLoader,
+            customTools,
+          }, workflowAction, () => blockedToolResult);
+          response = workflowResult.content;
+          outboundMetadata = workflowResult.metadata;
+        }
       } finally {
         unsubscribe();
       }
 
       console.error(`[runner] prompt-end session=${sessionId} seq=${message.seq} elapsedMs=${Date.now() - promptStartedAt} tokenChars=${tokens.join('').length}`);
 
-      const response = blockedToolResultText(blockedToolResult) ?? resolveSessionResponseText(currentSession, tokens);
+      if (workflowAction == null) {
+        response = blockedToolResultText(blockedToolResult) ?? resolveSessionResponseText(currentSession, tokens);
+        outboundMetadata = approvalResume != null && blockedToolResult == null
+          ? {
+              resumed_tool: true,
+              approval_id: approvalResume.approval_id,
+              tool_name: approvalResume.tool_name,
+              tool_args: approvalResume.tool_args,
+            }
+          : blockedToolResult;
+      }
+
       lastResponse = response;
       const seq = getNextOutboundSeq(lastOutSeq, message.seq);
-      const outboundMetadata = approvalResume != null && blockedToolResult == null
-        ? {
-            resumed_tool: true,
-            approval_id: approvalResume.approval_id,
-            tool_name: approvalResume.tool_name,
-            tool_args: approvalResume.tool_args,
-          }
-        : blockedToolResult;
 
       const outboundDb = openRunnerOutboundDb(outboundSessionDir);
 

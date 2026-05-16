@@ -270,6 +270,34 @@ OneCLI integration:
 - The container runtime only forwards an allowlisted subset of OneCLI gateway environment variables, so unrelated host secrets are not passed through accidentally.
 - Cove also loads [`pi-onecli-extension`](https://pi.dev/packages/pi-onecli-extension) for inherited OneCLI gateway runs when the extension is available in the runtime environment.
 
+## lean-ctx Integration
+
+[lean-ctx](https://leanctx.com) is pre-installed in the Cove agent container image. It reduces token consumption by up to 99% through compressed shell output and 58 MCP tools (`ctx_read`, `ctx_shell`, `ctx_search`, `ctx_tree`) that replace native file reads and shell calls with cache-aware, token-efficient equivalents.
+
+To enable lean-ctx for an agent group, include it in the `config.mcpServers` field when creating or updating the group:
+
+```bash
+curl -sS -X POST http://127.0.0.1:4111/v1/agent-groups \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "copilot-lean",
+    "name": "Copilot (lean-ctx)",
+    "provider": "github-copilot",
+    "model": "gpt-4.1",
+    "thinking": "medium",
+    "permissions": { "default": "auto" },
+    "config": {
+      "mcpServers": {
+        "lean-ctx": { "command": "lean-ctx" }
+      }
+    }
+  }'
+```
+
+Cove serializes `mcpServers` into the session's `mcp.json` so Pi picks it up automatically at session start. No other configuration is needed — `lean-ctx` (no arguments) starts the MCP server over stdio, which is the standard MCP transport.
+
+Shell compression hooks are also available for interactive bash sessions inside containers (`lean-ctx-on` / `lean-ctx-off`).
+
 ## Schedules, Workflows, And Approvals
 
 - Schedules are persisted cron jobs stored in the central database.

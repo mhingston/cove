@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
   DeliveryTimeoutError,
   findMissingOutboundSeqs,
+  pollForWorkflowActionResult,
   pollForResponse,
   readDeliverableMessages,
 } from '../src/delivery.ts';
@@ -438,6 +439,230 @@ describe('delivery', () => {
 
     expect(delivered).toEqual([
       expect.objectContaining({ id: 'out-3', seq: 3, content: 'slow reply' }),
+    ]);
+  });
+
+  it('workflow-aware polling ignores unrelated outbound rows after the baseline and waits for a matching workflow_action_result row', async () => {
+    const db = createOutboundDb();
+    let currentTime = 0;
+    let sleepCalls = 0;
+
+    writeOutboundMessage(db, {
+      id: 'out-3',
+      seq: 3,
+      role: 'assistant',
+      content: 'unrelated reply',
+      metadata: {
+        type: 'workflow_action_result',
+        request_id: 'req-other',
+        action: 'llm',
+        status: 'completed',
+        result: { text: 'other' },
+      },
+    });
+    writeProcessingAck(db, {
+      session_id: 'session-1',
+      last_in_seq: 2,
+      last_out_seq: 3,
+      heartbeat_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const delivered = await pollForWorkflowActionResult({
+      db,
+      sessionId: 'session-1',
+      requestId: 'req-123',
+      timeoutMs: 3,
+      pollIntervalMs: 1,
+      now: () => currentTime,
+      sleep: async (ms) => {
+        sleepCalls += 1;
+        currentTime += ms;
+
+        if (sleepCalls === 1) {
+          writeOutboundMessage(db, {
+            id: 'out-5',
+            seq: 5,
+            role: 'assistant',
+            content: '',
+            metadata: {
+              type: 'workflow_action_result',
+              request_id: 'req-123',
+              action: 'llm',
+              status: 'completed',
+              result: { text: 'matched' },
+            },
+          });
+          writeProcessingAck(db, {
+            session_id: 'session-1',
+            last_in_seq: 4,
+            last_out_seq: 5,
+            heartbeat_at: '2026-01-01T00:00:01.000Z',
+          });
+        }
+      },
+    });
+
+    expect(delivered).toEqual({
+      type: 'workflow_action_result',
+      request_id: 'req-123',
+      action: 'llm',
+      status: 'completed',
+      result: { text: 'matched' },
+    });
+    expect(sleepCalls).toBe(1);
+  });
+
+  it('returns the matching correlated workflow result by request id even when the action differs', async () => {
+    const db = createOutboundDb();
+
+    writeOutboundMessage(db, {
+      id: 'out-3',
+      seq: 3,
+      role: 'assistant',
+      content: '',
+      metadata: {
+        type: 'workflow_action_result',
+        request_id: 'req-123',
+        action: 'tool',
+        status: 'completed',
+        result: { text: 'matched' },
+      },
+    });
+    writeOutboundMessage(db, {
+      id: 'out-5',
+      seq: 5,
+      role: 'assistant',
+      content: '',
+      metadata: {
+        type: 'workflow_action_result',
+        request_id: 'req-other',
+        action: 'llm',
+        status: 'completed',
+        result: { text: 'other' },
+      },
+    });
+    writeProcessingAck(db, {
+      session_id: 'session-1',
+      last_in_seq: 4,
+      last_out_seq: 5,
+      heartbeat_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    await expect(
+      pollForWorkflowActionResult({
+        db,
+        sessionId: 'session-1',
+        requestId: 'req-123',
+        timeoutMs: 1,
+        pollIntervalMs: 1,
+        now: () => 0,
+        sleep: async () => {
+          throw new Error('sleep should not be called');
+        },
+      }),
+    ).resolves.toEqual({
+      type: 'workflow_action_result',
+      request_id: 'req-123',
+      action: 'tool',
+      status: 'completed',
+      result: { text: 'matched' },
+    });
+  });
+
+  it('times out when only unrelated workflow rows arrive', async () => {
+    const db = createOutboundDb();
+    let currentTime = 0;
+
+    writeOutboundMessage(db, {
+      id: 'out-3',
+      seq: 3,
+      role: 'assistant',
+      content: '',
+      metadata: {
+        type: 'workflow_action_result',
+        request_id: 'req-other',
+        action: 'llm',
+        status: 'completed',
+        result: { text: 'other' },
+      },
+    });
+    writeProcessingAck(db, {
+      session_id: 'session-1',
+      last_in_seq: 2,
+      last_out_seq: 3,
+      heartbeat_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    await expect(
+      pollForWorkflowActionResult({
+        db,
+        sessionId: 'session-1',
+        requestId: 'req-123',
+        timeoutMs: 1,
+        pollIntervalMs: 1,
+        now: () => currentTime,
+        sleep: async (ms) => {
+          currentTime += ms;
+        },
+      }),
+    ).rejects.toMatchObject({
+      name: 'DeliveryTimeoutError',
+      attempts: 1,
+      hasGaps: false,
+      statusCode: 504,
+    });
+  });
+
+  it('keeps baseline delivery behavior for readDeliverableMessages and pollForResponse unchanged alongside workflow polling', async () => {
+    const db = createOutboundDb();
+    let currentTime = 0;
+
+    writeOutboundMessage(db, {
+      id: 'out-3',
+      seq: 3,
+      role: 'assistant',
+      content: 'first reply',
+    });
+    writeOutboundMessage(db, {
+      id: 'out-5',
+      seq: 5,
+      role: 'assistant',
+      content: '',
+      metadata: {
+        type: 'workflow_action_result',
+        request_id: 'req-123',
+        action: 'llm',
+        status: 'completed',
+        result: { text: 'matched' },
+      },
+    });
+    writeProcessingAck(db, {
+      session_id: 'session-1',
+      last_in_seq: 4,
+      last_out_seq: 5,
+      heartbeat_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    expect(readDeliverableMessages({ db, sessionId: 'session-1', baselineOutSeq: 1 })).toEqual([
+      expect.objectContaining({ id: 'out-3', seq: 3, content: 'first reply' }),
+      expect.objectContaining({ id: 'out-5', seq: 5 }),
+    ]);
+
+    await expect(
+      pollForResponse({
+        db,
+        sessionId: 'session-1',
+        baselineOutSeq: 1,
+        timeoutMs: 1,
+        pollIntervalMs: 1,
+        now: () => currentTime,
+        sleep: async (ms) => {
+          currentTime += ms;
+        },
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({ id: 'out-3', seq: 3, content: 'first reply' }),
+      expect.objectContaining({ id: 'out-5', seq: 5 }),
     ]);
   });
 });

@@ -30,6 +30,27 @@ type JsonTool = {
   }>;
 };
 
+type HostToolDefinition = JsonTool & {
+  description: string;
+  parameters: Record<string, unknown>;
+  execute(toolCallId: string, params: Record<string, unknown>): Promise<{
+    content: Array<{ type: 'text'; text: string }>;
+    details: Record<string, unknown>;
+  }>;
+};
+
+type FakeMessageUpdate = {
+  type: 'message_update';
+  assistantMessageEvent?: { type: 'text_delta'; delta: string };
+};
+
+type FakeToolCallHandler = (
+  event: { toolName: string; input: Record<string, unknown> },
+) => Promise<{ block?: boolean; reason?: string } | undefined> | { block?: boolean; reason?: string } | undefined;
+
+type FakeCreateSessionOptions = Parameters<NonNullable<ContainerSessionDeps['createSession']>>[0];
+type FakeCreateSessionResult = Awaited<ReturnType<NonNullable<ContainerSessionDeps['createSession']>>>;
+
 function restoreEnvVar(key: string, value: string | undefined): void {
   if (value === undefined) {
     delete process.env[key];
@@ -110,6 +131,10 @@ function readAck(sessionDir: string, sessionId: string) {
   } finally {
     db.close();
   }
+}
+
+function parseOutboundMetadata(row: { metadata: string | null } | undefined): Record<string, unknown> | null {
+  return row?.metadata == null ? null : JSON.parse(row.metadata) as Record<string, unknown>;
 }
 
 function setupCentralDb(options: {
@@ -246,7 +271,7 @@ function createFakeDeps(options: {
   };
 } = {}): ContainerSessionDeps {
   return {
-    async createSession(sessionOptions) {
+    async createSession(sessionOptions: FakeCreateSessionOptions) {
       options.capture?.resourceLoaders?.push(sessionOptions.resourceLoader);
       options.capture?.customToolsHistory?.push(sessionOptions.customTools);
       options.capture?.configs?.push(sessionOptions.config);
@@ -267,12 +292,12 @@ function createFakeDeps(options: {
 
             for (const factory of sessionOptions.resourceLoader?.extensionFactories ?? []) {
               factory({
-                on(event, handler) {
+                on(event: 'tool_call' | 'before_agent_start' | 'context', handler: unknown) {
                   if (event === 'tool_call') {
                     handlers.push(handler as (event: { toolName: string; input: Record<string, unknown> }) => Promise<{ block?: boolean; reason?: string } | undefined> | { block?: boolean; reason?: string } | undefined);
                   }
                 },
-              });
+              } as unknown as Parameters<typeof factory>[0]);
             }
 
             if (options.toolCall != null) {
@@ -295,7 +320,184 @@ function createFakeDeps(options: {
             }
           },
         },
+      } as FakeCreateSessionResult;
+    },
+  };
+}
+
+function createHostActionDeps(options: {
+  promptResponseText?: string;
+  skillResponseText?: string;
+  promptError?: Error;
+  llmError?: Error;
+  llmAssistantMessage?: Record<string, unknown>;
+  toolDefinitions?: HostToolDefinition[];
+  blockedAction?: {
+    toolName: string;
+    input: Record<string, unknown>;
+  };
+  capture?: {
+    promptedMessages?: string[];
+    llmMessages?: unknown[];
+    toolExecutions?: Array<{ name: string; args: Record<string, unknown> }>;
+  };
+} = {}): ContainerSessionDeps {
+  return {
+    createCoveTools() {
+      return options.toolDefinitions ?? [];
+    },
+    async createSession(sessionOptions: FakeCreateSessionOptions) {
+      const listeners = new Set<(event: FakeMessageUpdate) => void>();
+      const toolHandlers: FakeToolCallHandler[] = [];
+
+      for (const factory of sessionOptions.resourceLoader?.extensionFactories ?? []) {
+        factory({
+          on(event: 'tool_call' | 'before_agent_start' | 'context', handler: unknown) {
+            if (event === 'tool_call') {
+              toolHandlers.push(handler as FakeToolCallHandler);
+            }
+          },
+        } as unknown as Parameters<typeof factory>[0]);
+      }
+
+      const agentState = {
+        systemPrompt: 'base system prompt',
+        messages: [] as Array<Record<string, unknown>>,
+        tools: (sessionOptions.customTools ?? options.toolDefinitions ?? []).map((tool) => ({
+          ...tool,
+          label: tool.name,
+        })),
       };
+
+      function createAssistantMessage(text: string, overrides?: Record<string, unknown>): Record<string, unknown> {
+        return {
+          role: 'assistant',
+          content: [{ type: 'text', text }],
+          api: 'anthropic-messages',
+          provider: 'anthropic',
+          model: sessionOptions.config.model,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            },
+          },
+          stopReason: 'stop',
+          timestamp: Date.now(),
+          ...(overrides ?? {}),
+        };
+      }
+
+      function pushAssistantMessage(message: Record<string, unknown>): void {
+        agentState.messages.push(message);
+      }
+
+      function emitAssistantText(text: string): void {
+        for (const listener of listeners) {
+          listener({
+            type: 'message_update',
+            assistantMessageEvent: { type: 'text_delta', delta: text },
+          });
+        }
+      }
+
+      async function runToolHandlers(toolName: string, input: Record<string, unknown>) {
+        for (const handler of toolHandlers) {
+          const result = await handler({ toolName, input });
+
+          if (result?.block) {
+            return result;
+          }
+        }
+
+        return undefined;
+      }
+
+      const session = {
+        agent: {
+          state: agentState,
+          async beforeToolCall(event: { toolCall: { name: string }; args: Record<string, unknown> }) {
+            return await runToolHandlers(event.toolCall.name, event.args);
+          },
+          async waitForIdle() {},
+          async prompt(messages: unknown) {
+            const normalizedMessages = Array.isArray(messages) ? messages : [messages];
+            options.capture?.llmMessages?.push(JSON.parse(JSON.stringify(normalizedMessages)));
+            agentState.messages.push(...(normalizedMessages as Array<Record<string, unknown>>));
+
+            if (options.blockedAction != null) {
+              const blocked = await runToolHandlers(options.blockedAction.toolName, options.blockedAction.input);
+
+              if (blocked?.block) {
+                return;
+              }
+            }
+
+            if (options.llmError != null) {
+              throw options.llmError;
+            }
+
+            const assistantMessage = (options.llmAssistantMessage ?? createAssistantMessage('LLM response text')) as Record<string, unknown>;
+            pushAssistantMessage(assistantMessage);
+          },
+        },
+        messages: agentState.messages,
+        getToolDefinition(name: string) {
+          return sessionOptions.customTools?.find((tool) => tool.name === name)
+            ?? options.toolDefinitions?.find((tool) => tool.name === name);
+        },
+        getLastAssistantText() {
+          const assistant = [...agentState.messages].reverse().find((message) => message.role === 'assistant');
+          const content = Array.isArray(assistant?.content)
+            ? assistant.content as Array<{ type?: unknown; text?: unknown }>
+            : [];
+
+          return content
+            .map((part) => part.type === 'text' && typeof part.text === 'string' ? part.text : '')
+            .join('');
+        },
+        async waitForIdle() {},
+        subscribe(handler: (event: FakeMessageUpdate) => void) {
+          listeners.add(handler);
+          return () => {
+            listeners.delete(handler);
+          };
+        },
+        async prompt(message: string) {
+          options.capture?.promptedMessages?.push(message);
+
+          if (options.blockedAction != null) {
+            const blocked = await runToolHandlers(options.blockedAction.toolName, options.blockedAction.input);
+
+            if (blocked?.block) {
+              return;
+            }
+          }
+
+          if (options.promptError != null) {
+            throw options.promptError;
+          }
+
+          const responseText = message.startsWith('/skill:')
+            ? options.skillResponseText ?? `Skill:${message}`
+            : options.promptResponseText ?? `Processed: ${message}`;
+          const assistantMessage = createAssistantMessage(responseText);
+          pushAssistantMessage(assistantMessage);
+          emitAssistantText(responseText);
+        },
+      };
+
+      return {
+        session,
+      } as unknown as FakeCreateSessionResult;
     },
   };
 }
@@ -2958,6 +3160,585 @@ describe('container runner phase 5', () => {
         model: 'claude-runner',
       },
     })).rejects.toThrow("Container agent model must include an explicit provider when provider is 'auto'.");
+
+    expect(readOutboundRows(sessionDir)).toEqual([]);
+    expect(readAck(sessionDir, sessionId)).toBeNull();
+  });
+
+  it('dispatches workflow_action.prompt through the session runtime and writes a correlated completed result envelope', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-prompt-');
+    const sessionId = 'sess-workflow-action-prompt-1';
+    const promptedMessages: string[] = [];
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-prompt-1',
+      action: 'prompt',
+      prompt: 'Summarise the workflow state.',
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps({
+        promptResponseText: 'Workflow prompt response',
+        capture: { promptedMessages },
+      }),
+    );
+
+    expect(response).toBe('Workflow prompt response');
+    expect(promptedMessages).toEqual(['Summarise the workflow state.']);
+    const outbound = readOutboundRows(sessionDir);
+    expect(outbound).toEqual([
+      {
+        seq: 3,
+        content: 'Workflow prompt response',
+        metadata: JSON.stringify({
+          type: 'workflow_action_result',
+          request_id: 'req-prompt-1',
+          action: 'prompt',
+          status: 'completed',
+          result: 'Workflow prompt response',
+        }),
+      },
+    ]);
+  });
+
+  it('dispatches workflow_action.skill through the session runtime using skill command syntax', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-skill-');
+    const sessionId = 'sess-workflow-action-skill-1';
+    const promptedMessages: string[] = [];
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-skill-1',
+      action: 'skill',
+      name: 'documentation-writer',
+      input: 'Draft a release note',
+    });
+
+    await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps({
+        skillResponseText: 'Skill execution output',
+        capture: { promptedMessages },
+      }),
+    );
+
+    expect(promptedMessages).toEqual(['/skill:documentation-writer Draft a release note']);
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 3,
+        content: 'Skill execution output',
+        metadata: JSON.stringify({
+          type: 'workflow_action_result',
+          request_id: 'req-skill-1',
+          action: 'skill',
+          status: 'completed',
+          result: 'Skill execution output',
+        }),
+      },
+    ]);
+  });
+
+  it('dispatches workflow_action.llm and preserves assistant text plus structured assistant metadata', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-llm-');
+    const sessionId = 'sess-workflow-action-llm-1';
+    const llmMessages: unknown[] = [];
+    const llmAssistantMessage = {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Structured LLM response' }],
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      model: 'workflow-llm-model',
+      usage: {
+        input: 12,
+        output: 7,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 19,
+        cost: {
+          input: 1,
+          output: 2,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 3,
+        },
+      },
+      stopReason: 'stop',
+      timestamp: 123456789,
+    };
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-llm-1',
+      action: 'llm',
+      messages: [{ role: 'user', content: 'Summarise the escalations' }],
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps({
+        llmAssistantMessage,
+        capture: { llmMessages },
+      }),
+    );
+
+    expect(response).toBe('Structured LLM response');
+    expect(llmMessages).toEqual([[{ role: 'user', content: 'Summarise the escalations' }]]);
+    const outbound = readOutboundRows(sessionDir);
+    expect(outbound[0]?.content).toBe('Structured LLM response');
+    expect(parseOutboundMetadata(outbound[0])).toEqual({
+      type: 'workflow_action_result',
+      request_id: 'req-llm-1',
+      action: 'llm',
+      status: 'completed',
+      result: llmAssistantMessage,
+    });
+  });
+
+  it('dispatches workflow_action.tool through the approval-governed tool path and wraps completed tool results', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-tool-');
+    const sessionId = 'sess-workflow-action-tool-1';
+    const toolExecutions: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const toolDefinitions: HostToolDefinition[] = [{
+      name: 'wiki_search',
+      description: 'Search wiki',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string' },
+        },
+        required: ['query'],
+      },
+      async execute(_toolCallId, params) {
+        toolExecutions.push({ name: 'wiki_search', args: params });
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tool: 'wiki_search', results: ['policy'] }) }],
+          details: {},
+        };
+      },
+    }];
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      permissions: JSON.stringify({ wiki_search: 'auto' }),
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-tool-1',
+      action: 'tool',
+      name: 'wiki_search',
+      args: { query: 'policy' },
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps({
+        toolDefinitions,
+        capture: { toolExecutions },
+      }),
+    );
+
+    expect(response).toBe('{"tool":"wiki_search","results":["policy"]}');
+    expect(toolExecutions).toEqual([{ name: 'wiki_search', args: { query: 'policy' } }]);
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 3,
+        content: '{"tool":"wiki_search","results":["policy"]}',
+        metadata: JSON.stringify({
+          type: 'workflow_action_result',
+          request_id: 'req-tool-1',
+          action: 'tool',
+          status: 'completed',
+          result: { tool: 'wiki_search', results: ['policy'] },
+        }),
+      },
+    ]);
+  });
+
+  it('writes blocked workflow tool results with blocked status and nested blocked payload', async () => {
+    const stateDir = makeTempDir('cove-v2-runner-workflow-action-tool-blocked-state-');
+    const sessionDir = path.join(stateDir, 'sessions', 'group-workflow-tool-blocked', 'sess-workflow-tool-blocked');
+    const sessionId = 'sess-workflow-tool-blocked';
+    const agentGroupId = 'group-workflow-tool-blocked';
+    const centralDbPath = setupCentralDb({ stateDir, sessionId, agentGroupId, sessionDir });
+    const toolDefinitions: HostToolDefinition[] = [{
+      name: 'bash',
+      description: 'Run bash',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string' },
+        },
+        required: ['command'],
+      },
+      async execute() {
+        throw new Error('tool should not execute while blocked');
+      },
+    }];
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      permissions: JSON.stringify({ bash: 'confirm' }),
+      extra_env: {
+        COVE_AGENT_GROUP_ID: agentGroupId,
+        COVE_CENTRAL_DB_PATH: centralDbPath,
+      },
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-tool-blocked-1',
+      action: 'tool',
+      name: 'bash',
+      args: { command: 'rm -rf /tmp/demo' },
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps({ toolDefinitions }),
+    );
+
+    expect(response).toBe('Approval required to run bash: rm -rf /tmp/demo');
+    const outbound = readOutboundRows(sessionDir);
+    const metadata = parseOutboundMetadata(outbound[0]);
+    expect(outbound[0]?.content).toBe('Approval required to run bash: rm -rf /tmp/demo');
+    expect(metadata).toEqual({
+      type: 'workflow_action_result',
+      request_id: 'req-tool-blocked-1',
+      action: 'tool',
+      status: 'blocked',
+      result: {
+        permission: 'confirm',
+        approval_id: expect.any(String),
+        message: 'Approval required to run bash: rm -rf /tmp/demo',
+        tool_name: 'bash',
+        tool_args: { command: 'rm -rf /tmp/demo' },
+        expires_at: expect.any(String),
+      },
+    });
+  });
+
+  it('writes workflow action execution failures with error status and explicit message', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-error-');
+    const sessionId = 'sess-workflow-action-error-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-error-1',
+      action: 'prompt',
+      prompt: 'This should fail',
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps({
+        promptError: new Error('session prompt exploded'),
+      }),
+    );
+
+    expect(response).toBe('session prompt exploded');
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 3,
+        content: 'session prompt exploded',
+        metadata: JSON.stringify({
+          type: 'workflow_action_result',
+          request_id: 'req-error-1',
+          action: 'prompt',
+          status: 'error',
+          error: { message: 'session prompt exploded' },
+        }),
+      },
+    ]);
+  });
+
+  it('rejects malformed workflow_action.llm metadata before writing synthetic assistant output', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-malformed-llm-');
+    const sessionId = 'sess-workflow-action-malformed-llm-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-malformed-llm-1',
+      action: 'llm',
+      messages: [123],
+    });
+
+    await expect(runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps(),
+    )).rejects.toThrow('Malformed workflow action metadata: llm messages must be an array of message objects');
+
+    expect(readOutboundRows(sessionDir)).toEqual([]);
+    expect(readAck(sessionDir, sessionId)).toBeNull();
+  });
+
+  it('writes blocked workflow prompt actions as clear errors instead of blocked success', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-prompt-blocked-');
+    const sessionId = 'sess-workflow-action-prompt-blocked-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      permissions: JSON.stringify({ write: 'prompt' }),
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-prompt-blocked-1',
+      action: 'prompt',
+      prompt: 'Try a blocked prompt action',
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps({
+        blockedAction: {
+          toolName: 'write',
+          input: { path: '/tmp/demo.txt' },
+        },
+      }),
+    );
+
+    expect(response).toBe('Workflow prompt action was blocked');
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 3,
+        content: 'Workflow prompt action was blocked',
+        metadata: JSON.stringify({
+          type: 'workflow_action_result',
+          request_id: 'req-prompt-blocked-1',
+          action: 'prompt',
+          status: 'error',
+          error: { message: 'Workflow prompt action was blocked' },
+        }),
+      },
+    ]);
+  });
+
+  it('writes blocked workflow llm actions as clear errors instead of blocked success', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-llm-blocked-');
+    const sessionId = 'sess-workflow-action-llm-blocked-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      permissions: JSON.stringify({ write: 'prompt' }),
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-llm-blocked-1',
+      action: 'llm',
+      messages: [{ role: 'user', content: 'Summarise the escalations' }],
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps({
+        blockedAction: {
+          toolName: 'write',
+          input: { path: '/tmp/demo.txt' },
+        },
+      }),
+    );
+
+    expect(response).toBe('Workflow LLM action was blocked');
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 3,
+        content: 'Workflow LLM action was blocked',
+        metadata: JSON.stringify({
+          type: 'workflow_action_result',
+          request_id: 'req-llm-blocked-1',
+          action: 'llm',
+          status: 'error',
+          error: { message: 'Workflow LLM action was blocked' },
+        }),
+      },
+    ]);
+  });
+
+  it('writes blocked workflow skill actions as clear errors instead of blocked success', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-skill-blocked-');
+    const sessionId = 'sess-workflow-action-skill-blocked-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+      permissions: JSON.stringify({ write: 'prompt' }),
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-skill-blocked-1',
+      action: 'skill',
+      name: 'documentation-writer',
+      input: 'Draft a release note',
+    });
+
+    const response = await runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps({
+        blockedAction: {
+          toolName: 'write',
+          input: { path: '/tmp/demo.txt' },
+        },
+      }),
+    );
+
+    expect(response).toBe('Workflow skill action was blocked: documentation-writer');
+    expect(readOutboundRows(sessionDir)).toEqual([
+      {
+        seq: 3,
+        content: 'Workflow skill action was blocked: documentation-writer',
+        metadata: JSON.stringify({
+          type: 'workflow_action_result',
+          request_id: 'req-skill-blocked-1',
+          action: 'skill',
+          status: 'error',
+          error: { message: 'Workflow skill action was blocked: documentation-writer' },
+        }),
+      },
+    ]);
+  });
+
+  it('fails clearly for malformed workflow action metadata instead of synthesizing assistant text', async () => {
+    const sessionDir = makeTempDir('cove-v2-runner-workflow-action-malformed-');
+    const sessionId = 'sess-workflow-action-malformed-1';
+
+    writeSessionConfig(sessionDir, {
+      provider: 'anthropic',
+      model: 'claude-runner',
+    });
+    writeUserMessage(sessionDir, '', {
+      type: 'workflow_action',
+      request_id: 'req-malformed-1',
+      action: 'tool',
+      name: 'wiki_search',
+    });
+
+    await expect(runContainerSession(
+      {
+        inboundPath: path.join(sessionDir, 'inbound.db'),
+        outboundPath: path.join(sessionDir, 'outbound.db'),
+        sessionId,
+        config: {
+          provider: 'anthropic',
+          model: 'claude-runner',
+        },
+      },
+      undefined,
+      createHostActionDeps(),
+    )).rejects.toThrow('Malformed workflow action metadata');
 
     expect(readOutboundRows(sessionDir)).toEqual([]);
     expect(readAck(sessionDir, sessionId)).toBeNull();

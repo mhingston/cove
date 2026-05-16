@@ -132,13 +132,13 @@ The default posture is conservative for mutating tools such as `bash` and `write
 
 ## Workflows
 
-Workflows are host-owned and do not move into session containers.
+Workflows are still host-owned and do not move into session containers, but some workflow steps now execute through the routed session runtime.
 
 - `src/workflows/runtime.ts` runs the Duroxide runtime and tracks workflow instances in the metadata database.
-- `src/workflows/session-bindings.ts` lets workflows call back into routed PI session behavior when needed.
+- `src/workflows/session-bindings.ts` keeps workflow orchestration on the host, but routes workflow `prompt`, `tool`, `llm`, and `skill` actions into the target session container by writing `workflow_action` metadata into the session queue and polling for a correlated `workflow_action_result`.
 - `src/api/handlers/workflows.ts` exposes the public workflow API.
 
-This means workflow definitions, lifecycle, waiting, signalling, and rollback stay centralized even when a workflow step needs an agent-backed prompt, tool call, or LLM call.
+This means workflow definitions, lifecycle, waiting, signalling, rollback, and `sendMessage()` stay centralized on the host even when a workflow step needs a container-backed prompt, tool call, skill call, or LLM call.
 
 ## Container Sweep
 

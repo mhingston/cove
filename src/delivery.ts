@@ -1,7 +1,12 @@
 import type { Database } from 'bun:sqlite';
 
 import { readProcessingAck, readVisibleOutboundMessages } from './session/outbound.ts';
-import type { DeliveryDbReader, OutboundMessageRow } from './shared/types.ts';
+import type {
+  DeliveryDbReader,
+  OutboundMessageRow,
+  WorkflowActionRequestMetadata,
+  WorkflowActionResultMetadata,
+} from './shared/types.ts';
 
 export class DeliveryTimeoutError extends Error {
   attempts: number;
@@ -80,6 +85,48 @@ export function readDeliverableMessages(options: {
   });
 }
 
+function readDeliverableWorkflowActionResult(options: {
+  sessionId: string;
+  baselineOutSeq: number;
+  requestId: string;
+} & DeliveryDbReader): WorkflowActionResultMetadata | null {
+  const messages = readDeliverableMessages(options);
+
+  if (messages == null) {
+    return null;
+  }
+
+  for (const message of messages) {
+    if (message.metadata == null) {
+      continue;
+    }
+
+    let metadata: unknown;
+
+    try {
+      metadata = JSON.parse(message.metadata);
+    } catch {
+      continue;
+    }
+
+    if (metadata == null || typeof metadata !== 'object') {
+      continue;
+    }
+
+    const candidate = metadata as Partial<WorkflowActionResultMetadata>;
+
+    if (
+      candidate.type === 'workflow_action_result'
+      && candidate.request_id === options.requestId
+      && (candidate.status === 'completed' || candidate.status === 'blocked' || candidate.status === 'error')
+    ) {
+      return candidate as WorkflowActionResultMetadata;
+    }
+  }
+
+  return null;
+}
+
 async function pollUntilTimeout(options: {
   sessionId: string;
   baselineOutSeq: number;
@@ -140,4 +187,38 @@ export async function pollForResponse(options: {
   }
 
   throw new DeliveryTimeoutError({ attempts: 2, hasGaps: false });
+}
+
+export async function pollForWorkflowActionResult(options: {
+  sessionId: string;
+  baselineOutSeq?: number;
+  requestId: string;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+} & DeliveryDbReader): Promise<WorkflowActionResultMetadata> {
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 25;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+  const baselineOutSeq = options.baselineOutSeq ?? 0;
+  const startedAt = now();
+
+  while (now() - startedAt < timeoutMs) {
+    const delivered = readDeliverableWorkflowActionResult({
+      ...options,
+      baselineOutSeq,
+    });
+
+    if (delivered != null) {
+      return delivered;
+    }
+
+    await sleep(pollIntervalMs);
+  }
+
+  const visibleMessages = withDeliveryDb(options, (db) => readVisibleOutboundMessages(db, baselineOutSeq));
+  const hasGaps = findMissingOutboundSeqs(visibleMessages, baselineOutSeq).length > 0;
+  throw new DeliveryTimeoutError({ attempts: 1, hasGaps });
 }

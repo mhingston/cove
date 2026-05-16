@@ -8,8 +8,13 @@ import { createWorkflowSessionBindings } from '../../src/workflows/session-bindi
 import type { ContainerSessionDeps } from '../../src/container-agent/runner.ts';
 import { createSessionForThread } from '../../src/session/manager.ts';
 import { openInboundDb } from '../../src/session/inbound.ts';
-import { openOutboundDb, readProcessingAck } from '../../src/session/outbound.ts';
-import type { SessionConfig } from '../../src/shared/types.ts';
+import {
+  getNextOutboundSeq,
+  openOutboundDb,
+  readProcessingAck,
+  writeOutboundMessage,
+  writeProcessingAck,
+} from '../../src/session/outbound.ts';
 import { createWorkflowRuntime, type WorkflowRuntime } from '../../src/workflows/runtime.ts';
 
 const createdPaths: string[] = [];
@@ -22,7 +27,7 @@ type FakeRunnerSessionOptions = {
     promptedMessages: string[];
     resourceLoaders?: Array<unknown>;
     customToolsHistory?: Array<unknown>;
-    configs?: SessionConfig[];
+    configs?: Array<unknown>;
   };
 };
 
@@ -110,6 +115,43 @@ function createCentralDb(): Database {
   );
   createdDbs.push(db);
   return db;
+}
+
+async function waitForInboundWorkflowActionRequest(sessionDir: string, timeoutMs = 1_000): Promise<{
+  request_id: string;
+  action: 'prompt' | 'tool' | 'llm' | 'skill';
+}> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const inboundDb = openInboundDb(sessionDir);
+
+    try {
+      const latestInbound = inboundDb.prepare(
+        'SELECT metadata FROM messages_in ORDER BY seq DESC LIMIT 1',
+      ).get() as { metadata: string | null } | null;
+      const metadata = latestInbound?.metadata == null
+        ? null
+        : JSON.parse(latestInbound.metadata) as { type?: string; request_id?: string; action?: unknown };
+
+      if (
+        metadata?.type === 'workflow_action'
+        && typeof metadata.request_id === 'string'
+        && (metadata.action === 'prompt' || metadata.action === 'tool' || metadata.action === 'llm' || metadata.action === 'skill')
+      ) {
+        return {
+          request_id: metadata.request_id,
+          action: metadata.action,
+        };
+      }
+    } finally {
+      inboundDb.close();
+    }
+
+    await Bun.sleep(10);
+  }
+
+  throw new Error('Timed out waiting for workflow action request metadata');
 }
 
 function updateAgentGroup(options: {
@@ -816,14 +858,14 @@ describe('workflow runtime', () => {
     }
   });
 
-  it('routes __pi_prompt through the host-owned session prompt path using workflow execution context', async () => {
+  it('routes __pi_prompt through workflow action metadata using workflow execution context', async () => {
     const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
     const databasePath = `${stateDir}/workflows.db`;
     createdPaths.push(stateDir);
 
     const centralDb = createCentralDb();
     const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string | null }> = [];
-    const pollCalls: Array<{ sessionId: string; baselineOutSeq: number }> = [];
+    const pollCalls: Array<{ sessionId: string; requestId: string; action: string }> = [];
     const runtime = createWorkflowRuntime(databasePath);
     runtime.bindPi(createWorkflowSessionBindings({
       db: centralDb,
@@ -836,20 +878,15 @@ describe('workflow runtime', () => {
         });
         return true;
       },
-      pollForResponse: async ({ sessionId, baselineOutSeq }) => {
-        pollCalls.push({ sessionId, baselineOutSeq });
-        return [
-          {
-            id: 'out-1',
-            seq: 1,
-            role: 'assistant',
-            content: 'Summarised sales',
-            finish_reason: 'stop',
-            tool_calls: null,
-            metadata: null,
-            created_at: '2026-01-15T09:00:00.000Z',
-          },
-        ];
+      pollForWorkflowActionResult: async ({ sessionId, requestId }) => {
+        pollCalls.push({ sessionId, requestId, action: 'prompt' });
+        return {
+          type: 'workflow_action_result',
+          request_id: requestId,
+          action: 'prompt',
+          status: 'completed',
+          result: 'Summarised sales',
+        };
       },
     }));
 
@@ -913,16 +950,22 @@ describe('workflow runtime', () => {
           model: 'prompt-model',
         },
       ]);
-      expect(pollCalls).toEqual([{ sessionId: session!.id, baselineOutSeq: 0 }]);
+      expect(pollCalls).toEqual([{ sessionId: session!.id, requestId: expect.any(String), action: 'prompt' }]);
 
       const inboundDb = openInboundDb(session!.session_file);
       try {
         const configRow = inboundDb.prepare('SELECT model FROM session_config').get() as { model: string } | null;
         expect(configRow?.model).toBe('prompt-model');
-        expect(inboundDb.prepare('SELECT role, content FROM messages_in ORDER BY seq ASC').all()).toEqual([
+        expect(inboundDb.prepare('SELECT role, content, metadata FROM messages_in ORDER BY seq ASC').all()).toEqual([
           {
             role: 'user',
             content: 'Summarise sales',
+            metadata: JSON.stringify({
+              type: 'workflow_action',
+              request_id: pollCalls[0]!.requestId,
+              action: 'prompt',
+              prompt: 'Summarise sales',
+            }),
           },
         ]);
       } finally {
@@ -944,7 +987,7 @@ describe('workflow runtime', () => {
       model: null,
     });
     const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string | null }> = [];
-    const pollCalls: Array<{ sessionId: string; baselineOutSeq: number }> = [];
+    const pollCalls: Array<{ sessionId: string; requestId: string; action: string }> = [];
     const runtime = createWorkflowRuntime(databasePath);
     runtime.bindPi(createWorkflowSessionBindings({
       db: centralDb,
@@ -957,20 +1000,15 @@ describe('workflow runtime', () => {
         });
         return true;
       },
-      pollForResponse: async ({ sessionId, baselineOutSeq }) => {
-        pollCalls.push({ sessionId, baselineOutSeq });
-        return [
-          {
-            id: 'out-1',
-            seq: 1,
-            role: 'assistant',
-            content: 'Summarised sales',
-            finish_reason: 'stop',
-            tool_calls: null,
-            metadata: null,
-            created_at: '2026-01-15T09:00:00.000Z',
-          },
-        ];
+      pollForWorkflowActionResult: async ({ sessionId, requestId }) => {
+        pollCalls.push({ sessionId, requestId, action: 'prompt' });
+        return {
+          type: 'workflow_action_result',
+          request_id: requestId,
+          action: 'prompt',
+          status: 'completed',
+          result: 'Summarised sales',
+        };
       },
     }));
 
@@ -1034,16 +1072,22 @@ describe('workflow runtime', () => {
           model: null,
         },
       ]);
-      expect(pollCalls).toEqual([{ sessionId: session!.id, baselineOutSeq: 0 }]);
+      expect(pollCalls).toEqual([{ sessionId: session!.id, requestId: expect.any(String), action: 'prompt' }]);
 
       const inboundDb = openInboundDb(session!.session_file);
       try {
         const configRow = inboundDb.prepare('SELECT model FROM session_config').get() as { model: string | null } | null;
         expect(configRow?.model).toBeNull();
-        expect(inboundDb.prepare('SELECT role, content FROM messages_in ORDER BY seq ASC').all()).toEqual([
+        expect(inboundDb.prepare('SELECT role, content, metadata FROM messages_in ORDER BY seq ASC').all()).toEqual([
           {
             role: 'user',
             content: 'Summarise sales',
+            metadata: JSON.stringify({
+              type: 'workflow_action',
+              request_id: pollCalls[0]!.requestId,
+              action: 'prompt',
+              prompt: 'Summarise sales',
+            }),
           },
         ]);
       } finally {
@@ -1230,7 +1274,7 @@ describe('workflow runtime', () => {
     }
   });
 
-  it('routes __pi_prompt to the targeted session when workflow execution context provides session_id', async () => {
+  it('routes __pi_prompt to the targeted session through workflow action metadata when workflow execution context provides session_id', async () => {
     const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
     const databasePath = `${stateDir}/workflows.db`;
     createdPaths.push(stateDir);
@@ -1243,7 +1287,7 @@ describe('workflow runtime', () => {
       threadId: 'existing-thread',
     });
     const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string | null }> = [];
-    const pollCalls: Array<{ sessionId: string; baselineOutSeq: number }> = [];
+    const pollCalls: Array<{ sessionId: string; requestId: string; action: string }> = [];
     const runtime = createWorkflowRuntime(databasePath);
     runtime.bindPi(createWorkflowSessionBindings({
       db: centralDb,
@@ -1256,20 +1300,15 @@ describe('workflow runtime', () => {
         });
         return true;
       },
-      pollForResponse: async ({ sessionId, baselineOutSeq }) => {
-        pollCalls.push({ sessionId, baselineOutSeq });
-        return [
-          {
-            id: 'out-1',
-            seq: 1,
-            role: 'assistant',
-            content: 'Existing session summary',
-            finish_reason: 'stop',
-            tool_calls: null,
-            metadata: null,
-            created_at: '2026-01-15T09:00:00.000Z',
-          },
-        ];
+      pollForWorkflowActionResult: async ({ sessionId, requestId }) => {
+        pollCalls.push({ sessionId, requestId, action: 'prompt' });
+        return {
+          type: 'workflow_action_result',
+          request_id: requestId,
+          action: 'prompt',
+          status: 'completed',
+          result: 'Existing session summary',
+        };
       },
     }));
 
@@ -1325,16 +1364,200 @@ describe('workflow runtime', () => {
           model: 'prompt-model',
         },
       ]);
-      expect(pollCalls).toEqual([{ sessionId: existingSession.id, baselineOutSeq: 0 }]);
+      expect(pollCalls).toEqual([{ sessionId: existingSession.id, requestId: expect.any(String), action: 'prompt' }]);
 
       const inboundDb = openInboundDb(existingSession.session_file!);
       try {
         const configRow = inboundDb.prepare('SELECT model FROM session_config').get() as { model: string } | null;
         expect(configRow?.model).toBe('prompt-model');
-        expect(inboundDb.prepare('SELECT role, content FROM messages_in ORDER BY seq ASC').all()).toEqual([
+        expect(inboundDb.prepare('SELECT role, content, metadata FROM messages_in ORDER BY seq ASC').all()).toEqual([
           {
             role: 'user',
             content: 'Summarise the existing session',
+            metadata: JSON.stringify({
+              type: 'workflow_action',
+              request_id: pollCalls[0]!.requestId,
+              action: 'prompt',
+              prompt: 'Summarise the existing session',
+            }),
+          },
+        ]);
+      } finally {
+        inboundDb.close();
+      }
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('uses the production workflow action poller by default and ignores stale matching rows written before the baseline', async () => {
+    const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
+    const databasePath = `${stateDir}/workflows.db`;
+    createdPaths.push(stateDir);
+
+    const centralDb = createCentralDb();
+    const existingSession = createSessionForThread({
+      db: centralDb,
+      stateDir,
+      agentGroupId: 'support',
+      threadId: 'existing-thread',
+    });
+    const ensureSessionRuntimeCalls: Array<{ sessionId: string; threadId: string; model: string | null }> = [];
+    const runtime = createWorkflowRuntime(databasePath);
+    runtime.bindPi(createWorkflowSessionBindings({
+      db: centralDb,
+      stateDir,
+      ensureSessionRuntime: async ({ routed, config }) => {
+        ensureSessionRuntimeCalls.push({
+          sessionId: routed.session.id,
+          threadId: routed.threadId,
+          model: config.model,
+        });
+        return true;
+      },
+    }));
+
+    runtime.registerDefinition({
+      name: 'prompt-existing-session-default-poller-workflow',
+      description: 'Calls ctx.pi.prompt with the production workflow action poller',
+      *generator(ctx) {
+        const response = yield ctx.pi.prompt('Summarise the existing session', { model: 'prompt-model' });
+        return { response };
+      },
+    });
+
+    await runtime.start();
+
+    try {
+      const staleOutboundDb = openOutboundDb(existingSession.session_file!);
+      try {
+        writeOutboundMessage(staleOutboundDb, {
+          id: 'out-stale',
+          seq: 3,
+          role: 'assistant',
+          content: 'Stale matching result',
+          metadata: {
+            type: 'workflow_action_result',
+            request_id: 'req-placeholder',
+            action: 'prompt',
+            status: 'completed',
+            result: 'Stale matching result',
+          },
+        });
+        writeProcessingAck(staleOutboundDb, {
+          session_id: existingSession.id,
+          last_in_seq: 2,
+          last_out_seq: 3,
+          heartbeat_at: '2026-01-15T08:59:00.000Z',
+        });
+      } finally {
+        staleOutboundDb.close();
+      }
+
+      const started = await runtime.workflowService.startWorkflow({
+        id: 'instance-prompt-session-default-poller',
+        name: 'prompt-existing-session-default-poller-workflow',
+        input: null,
+        context: {
+          trigger: 'tool',
+          agent_group_id: 'support',
+          session_id: existingSession.id,
+          thread_id: 'ignored-thread',
+        },
+      });
+
+      const workflowActionRequest = await waitForInboundWorkflowActionRequest(existingSession.session_file!);
+      expect(workflowActionRequest.action).toBe('prompt');
+
+      const outboundDb = openOutboundDb(existingSession.session_file!);
+      try {
+        outboundDb.prepare('UPDATE messages_out SET metadata = ? WHERE id = ?').run(
+          JSON.stringify({
+            type: 'workflow_action_result',
+            request_id: workflowActionRequest.request_id,
+            action: 'prompt',
+            status: 'completed',
+            result: 'Stale matching result',
+          }),
+          'out-stale',
+        );
+
+        const ack = readProcessingAck(outboundDb, existingSession.id);
+        const seq = getNextOutboundSeq(ack?.last_out_seq ?? null, ack?.last_in_seq ?? 0);
+
+        writeOutboundMessage(outboundDb, {
+          id: 'out-fresh',
+          seq,
+          role: 'assistant',
+          content: 'Existing session summary',
+          metadata: {
+            type: 'workflow_action_result',
+            request_id: workflowActionRequest.request_id,
+            action: 'prompt',
+            status: 'completed',
+            result: 'Existing session summary',
+          },
+        });
+        writeProcessingAck(outboundDb, {
+          session_id: existingSession.id,
+          last_in_seq: ack?.last_in_seq ?? null,
+          last_out_seq: seq,
+          heartbeat_at: '2026-01-15T09:00:00.000Z',
+        });
+      } finally {
+        outboundDb.close();
+      }
+
+      await expect(runtime.workflowService.waitForWorkflow({
+        instanceId: started.instanceId,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      })).resolves.toEqual({
+        instanceId: 'instance-prompt-session-default-poller',
+        name: 'prompt-existing-session-default-poller-workflow',
+        status: 'Completed',
+        customStatus: null,
+        createdAt: expect.any(String),
+        updatedAt: expect.any(String),
+        input: null,
+        output: {
+          response: 'Existing session summary',
+        },
+        error: null,
+      });
+
+      const sessionCount = centralDb.prepare('SELECT COUNT(*) AS count FROM sessions').get() as { count: number };
+      expect(sessionCount.count).toBe(1);
+      expect(centralDb.prepare('SELECT id FROM sessions WHERE thread_id = ?').get('ignored-thread')).toBeNull();
+      expect(ensureSessionRuntimeCalls).toEqual([
+        {
+          sessionId: existingSession.id,
+          threadId: 'existing-thread',
+          model: 'prompt-model',
+        },
+      ]);
+
+      const inboundDb = openInboundDb(existingSession.session_file!);
+      try {
+        const configRow = inboundDb.prepare('SELECT model FROM session_config').get() as { model: string } | null;
+        const inboundMessages = inboundDb.prepare('SELECT role, content, metadata FROM messages_in ORDER BY seq ASC').all() as Array<{
+          role: string;
+          content: string;
+          metadata: string | null;
+        }>;
+        const requestId = JSON.parse(inboundMessages[0]!.metadata ?? '{}') as { request_id?: string };
+
+        expect(configRow?.model).toBe('prompt-model');
+        expect(inboundMessages).toEqual([
+          {
+            role: 'user',
+            content: 'Summarise the existing session',
+            metadata: JSON.stringify({
+              type: 'workflow_action',
+              request_id: requestId.request_id,
+              action: 'prompt',
+              prompt: 'Summarise the existing session',
+            }),
           },
         ]);
       } finally {
@@ -1436,7 +1659,7 @@ describe('workflow runtime', () => {
     }
   });
 
-  it('routes __pi_tool through the host-owned runner using workflow execution context', async () => {
+  it('routes __pi_tool through workflow action metadata using workflow execution context', async () => {
     const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
     const databasePath = `${stateDir}/workflows.db`;
     createdPaths.push(stateDir);
@@ -1446,31 +1669,33 @@ describe('workflow runtime', () => {
       JSON.stringify({ default: 'ask', wiki_search: 'auto' }),
       'support',
     );
-    const captured = {
-      promptedMessages: [] as string[],
-      configs: [] as SessionConfig[],
-      customToolsHistory: [] as Array<unknown>,
-    };
+    const pollCalls: Array<{ sessionId: string; requestId: string; action: string }> = [];
     const runtime = createWorkflowRuntime(databasePath);
     runtime.bindPi(createWorkflowSessionBindings({
       db: centralDb,
       stateDir,
-      runnerDeps: createFakeRunnerDeps({
-        responseText: 'Tool call completed',
-        capture: captured,
-      }),
-      createCoveTools(_db, _embedTexts, runtimeScope) {
-        return [{
-          name: 'wiki_search',
-          description: 'Search wiki entries',
-          parameters: { type: 'object', properties: {} },
-          async execute(_toolCallId, params) {
-            return {
-              content: [{ type: 'text', text: JSON.stringify({ runtimeScope, params }) }],
-              details: {},
-            };
+      runnerDeps: {
+        async createSession() {
+          throw new Error('sendMessage remains the only host-owned binding');
+        },
+      },
+      pollForWorkflowActionResult: async ({ sessionId, requestId }) => {
+        pollCalls.push({ sessionId, requestId, action: 'tool' });
+        return {
+          type: 'workflow_action_result',
+          request_id: requestId,
+          action: 'tool',
+          status: 'completed',
+          result: {
+            runtimeScope: {
+              agentGroupId: 'support',
+              sessionId,
+            },
+            params: {
+              query: 'policies',
+            },
           },
-        }];
+        };
       },
     }));
 
@@ -1523,48 +1748,63 @@ describe('workflow runtime', () => {
         error: null,
       });
 
-      expect(captured.promptedMessages).toEqual([]);
-      expect(captured.configs).toEqual([
-        expect.objectContaining({
-          provider: 'anthropic',
-          model: 'support-model',
-        }),
-      ]);
-      expect(captured.customToolsHistory).toEqual([
-        expect.arrayContaining([
-          expect.objectContaining({ name: 'wiki_search' }),
-        ]),
-      ]);
+      const session = centralDb.prepare(
+        'SELECT id, session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?',
+      ).get('support', 'workflow:tool-binding') as {
+        id: string;
+        session_file: string;
+      } | null;
+      expect(session).not.toBeNull();
+      expect(pollCalls).toEqual([{ sessionId: session!.id, requestId: expect.any(String), action: 'tool' }]);
+
+      const inboundDb = openInboundDb(session!.session_file);
+      try {
+        expect(inboundDb.prepare('SELECT role, content, metadata FROM messages_in ORDER BY seq ASC').all()).toEqual([
+          {
+            role: 'user',
+            content: '',
+            metadata: JSON.stringify({
+              type: 'workflow_action',
+              request_id: pollCalls[0]!.requestId,
+              action: 'tool',
+              name: 'wiki_search',
+              args: { query: 'policies' },
+            }),
+          },
+        ]);
+      } finally {
+        inboundDb.close();
+      }
     } finally {
       await runtime.stop();
     }
   });
 
-  it('routes __pi_tool through the host-owned approval path and surfaces blocked runtime output cleanly', async () => {
+  it('routes __pi_tool blocked results through the workflow action contract and surfaces blocked runtime output cleanly', async () => {
     const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
     const databasePath = `${stateDir}/workflows.db`;
     createdPaths.push(stateDir);
 
     const centralDb = createCentralDb();
+    const pollCalls: Array<{ sessionId: string; requestId: string; action: string }> = [];
     const runtime = createWorkflowRuntime(databasePath);
     runtime.bindPi(createWorkflowSessionBindings({
       db: centralDb,
       stateDir,
-      runnerDeps: createFakeRunnerDeps({
-        toolCall: { toolName: 'wiki_search', input: { query: 'policies' } },
-      }),
-      createCoveTools() {
-        return [{
-          name: 'wiki_search',
-          description: 'Search wiki entries',
-          parameters: { type: 'object', properties: {} },
-          async execute() {
-            return {
-              content: [{ type: 'text', text: '{}' }],
-              details: {},
-            };
-          },
-        }];
+      runnerDeps: {
+        async createSession() {
+          throw new Error('sendMessage remains the only host-owned binding');
+        },
+      },
+      pollForWorkflowActionResult: async ({ sessionId, requestId }) => {
+        pollCalls.push({ sessionId, requestId, action: 'tool' });
+        return {
+          type: 'workflow_action_result',
+          request_id: requestId,
+          action: 'tool',
+          status: 'blocked',
+          result: "Tool 'wiki_search' requires confirmation from the user before it can run.",
+        };
       },
     }));
 
@@ -1608,30 +1848,86 @@ describe('workflow runtime', () => {
         },
         error: null,
       });
+
+      const session = centralDb.prepare(
+        'SELECT id, session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?',
+      ).get('support', 'workflow:tool-approval') as {
+        id: string;
+        session_file: string;
+      } | null;
+      expect(session).not.toBeNull();
+      expect(pollCalls).toEqual([{ sessionId: session!.id, requestId: expect.any(String), action: 'tool' }]);
+
+      const inboundDb = openInboundDb(session!.session_file);
+      try {
+        expect(inboundDb.prepare('SELECT role, content, metadata FROM messages_in ORDER BY seq ASC').all()).toEqual([
+          {
+            role: 'user',
+            content: '',
+            metadata: JSON.stringify({
+              type: 'workflow_action',
+              request_id: pollCalls[0]!.requestId,
+              action: 'tool',
+              name: 'wiki_search',
+              args: { query: 'policies' },
+            }),
+          },
+        ]);
+      } finally {
+        inboundDb.close();
+      }
     } finally {
       await runtime.stop();
     }
   });
 
-  it('routes __pi_llm through the host-owned runner with workflow model overrides', async () => {
+  it('routes __pi_llm through workflow action metadata with workflow model overrides', async () => {
     const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
     const databasePath = `${stateDir}/workflows.db`;
     createdPaths.push(stateDir);
 
     const centralDb = createCentralDb();
-    const captured = {
-      promptedMessages: [] as string[],
-      configs: [] as SessionConfig[],
-      resourceLoaders: [] as Array<unknown>,
-    };
+    const pollCalls: Array<{ sessionId: string; requestId: string; action: string }> = [];
     const runtime = createWorkflowRuntime(databasePath);
     runtime.bindPi(createWorkflowSessionBindings({
       db: centralDb,
       stateDir,
-      runnerDeps: createFakeRunnerDeps({
-        responseText: 'Host LLM response',
-        capture: captured,
-      }),
+      runnerDeps: {
+        async createSession() {
+          throw new Error('sendMessage remains the only host-owned binding');
+        },
+      },
+      pollForWorkflowActionResult: async ({ sessionId, requestId }) => {
+        pollCalls.push({ sessionId, requestId, action: 'llm' });
+        return {
+          type: 'workflow_action_result',
+          request_id: requestId,
+          action: 'llm',
+          status: 'completed',
+          result: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Host LLM response' }],
+            api: 'anthropic-messages',
+            provider: 'anthropic',
+            model: 'workflow-llm-model',
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                total: 0,
+              },
+            },
+            stopReason: 'stop',
+          },
+        };
+      },
     }));
 
     runtime.registerDefinition({
@@ -1640,7 +1936,10 @@ describe('workflow runtime', () => {
       *generator(ctx) {
         const response = yield ctx.pi.llm([
           { role: 'user', content: 'Summarise the escalations' },
-        ], { model: 'workflow-llm-model' });
+        ], {
+          model: 'workflow-llm-model',
+          tools: [{ name: 'per-call-tool', description: 'should stay inert' }],
+        });
         return { response };
       },
     });
@@ -1698,45 +1997,239 @@ describe('workflow runtime', () => {
         error: null,
       });
 
-      expect(captured.promptedMessages).toEqual(['Summarise the escalations']);
-      expect(captured.configs).toEqual([
-        expect.objectContaining({
-          provider: 'anthropic',
-          model: 'workflow-llm-model',
-        }),
-      ]);
-      expect(captured.resourceLoaders).toEqual([
-        expect.objectContaining({
-          agentDir: expect.stringContaining('/.pi-agent'),
-          additionalExtensionPaths: [],
-          noSkills: true,
-          extensionFactories: expect.any(Array),
-        }),
-      ]);
+      const session = centralDb.prepare(
+        'SELECT id, session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?',
+      ).get('support', 'workflow:llm-binding') as {
+        id: string;
+        session_file: string;
+      } | null;
+      expect(session).not.toBeNull();
+      expect(pollCalls).toEqual([{ sessionId: session!.id, requestId: expect.any(String), action: 'llm' }]);
+
+      const inboundDb = openInboundDb(session!.session_file);
+      try {
+        const configRow = inboundDb.prepare('SELECT model FROM session_config').get() as { model: string } | null;
+        expect(configRow?.model).toBe('workflow-llm-model');
+        expect(inboundDb.prepare('SELECT role, content, metadata FROM messages_in ORDER BY seq ASC').all()).toEqual([
+          {
+            role: 'user',
+            content: '',
+            metadata: JSON.stringify({
+              type: 'workflow_action',
+              request_id: pollCalls[0]!.requestId,
+              action: 'llm',
+              messages: [{ role: 'user', content: 'Summarise the escalations' }],
+            }),
+          },
+        ]);
+      } finally {
+        inboundDb.close();
+      }
     } finally {
       await runtime.stop();
     }
   });
 
-  it('routes __pi_skill through the host-owned runner with workflow model and skill context', async () => {
+  it('keeps llm per-call tools inert and out of workflow action metadata', async () => {
     const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
     const databasePath = `${stateDir}/workflows.db`;
     createdPaths.push(stateDir);
 
     const centralDb = createCentralDb();
-    const captured = {
-      promptedMessages: [] as string[],
-      configs: [] as SessionConfig[],
-      resourceLoaders: [] as Array<unknown>,
-    };
     const runtime = createWorkflowRuntime(databasePath);
     runtime.bindPi(createWorkflowSessionBindings({
       db: centralDb,
       stateDir,
-      runnerDeps: createFakeRunnerDeps({
-        responseText: 'Skill result text',
-        capture: captured,
+      pollForWorkflowActionResult: async ({ requestId }) => ({
+        type: 'workflow_action_result',
+        request_id: requestId,
+        action: 'llm',
+        status: 'completed',
+        result: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'No tools wired' }],
+          api: 'anthropic-messages',
+          provider: 'anthropic',
+          model: 'workflow-llm-model',
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            },
+          },
+          stopReason: 'stop',
+        },
       }),
+    }));
+
+    runtime.registerDefinition({
+      name: 'llm-tools-inert-workflow',
+      description: 'Calls ctx.pi.llm with per-call tools that must stay inert',
+      *generator(ctx) {
+        const response = yield ctx.pi.llm([
+          { role: 'user', content: 'Summarise the escalations' },
+        ], {
+          model: 'workflow-llm-model',
+          tools: [
+            { name: 'per-call-tool', description: 'should stay inert' },
+            { name: 'another-tool', description: 'still inert' },
+          ],
+        });
+        return { response };
+      },
+    });
+
+    await runtime.start();
+
+    try {
+      const started = await runtime.workflowService.startWorkflow({
+        id: 'instance-llm-tools-inert',
+        name: 'llm-tools-inert-workflow',
+        input: null,
+        context: {
+          trigger: 'api',
+          agent_group_id: 'support',
+          thread_id: 'workflow:llm-tools-inert',
+        },
+      });
+
+      await expect(runtime.workflowService.waitForWorkflow({
+        instanceId: started.instanceId,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      })).resolves.toMatchObject({
+        instanceId: 'instance-llm-tools-inert',
+        name: 'llm-tools-inert-workflow',
+        status: 'Completed',
+        output: {
+          response: {
+            model: 'workflow-llm-model',
+          },
+        },
+        error: null,
+      });
+
+      const session = centralDb.prepare(
+        'SELECT session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?',
+      ).get('support', 'workflow:llm-tools-inert') as {
+        session_file: string;
+      } | null;
+      expect(session).not.toBeNull();
+
+      const inboundDb = openInboundDb(session!.session_file);
+      try {
+        const row = inboundDb.prepare('SELECT metadata FROM messages_in ORDER BY seq ASC').get() as { metadata: string } | null;
+        expect(row).not.toBeNull();
+        expect(row!.metadata).not.toContain('per-call-tool');
+        expect(row!.metadata).not.toContain('another-tool');
+        expect(JSON.parse(row!.metadata)).toEqual({
+          type: 'workflow_action',
+          request_id: expect.any(String),
+          action: 'llm',
+          messages: [{ role: 'user', content: 'Summarise the escalations' }],
+        });
+      } finally {
+        inboundDb.close();
+      }
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('fails __pi_llm when the workflow action poller reports blocked', async () => {
+    const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
+    const databasePath = `${stateDir}/workflows.db`;
+    createdPaths.push(stateDir);
+
+    const centralDb = createCentralDb();
+    const runtime = createWorkflowRuntime(databasePath);
+    runtime.bindPi(createWorkflowSessionBindings({
+      db: centralDb,
+      stateDir,
+      pollForWorkflowActionResult: async ({ requestId }) => ({
+        type: 'workflow_action_result',
+        request_id: requestId,
+        action: 'llm',
+        status: 'blocked',
+        result: 'workflow blocked llm',
+      }),
+    }));
+
+    runtime.registerDefinition({
+      name: 'llm-blocked-workflow',
+      description: 'Calls ctx.pi.llm when blocked should fail',
+      *generator(ctx) {
+        const response = yield ctx.pi.llm([{ role: 'user', content: 'Summarise the escalations' }]);
+        return { response };
+      },
+    });
+
+    await runtime.start();
+
+    try {
+      const started = await runtime.workflowService.startWorkflow({
+        id: 'instance-llm-blocked',
+        name: 'llm-blocked-workflow',
+        input: null,
+        context: {
+          trigger: 'api',
+          agent_group_id: 'support',
+          thread_id: 'workflow:llm-blocked',
+        },
+      });
+
+      await expect(runtime.workflowService.waitForWorkflow({
+        instanceId: started.instanceId,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      })).resolves.toMatchObject({
+        instanceId: 'instance-llm-blocked',
+        name: 'llm-blocked-workflow',
+        status: 'Failed',
+        output: null,
+        error: {
+          message: 'Workflow LLM action was blocked',
+        },
+      });
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('routes __pi_skill through workflow action metadata with workflow model and skill context', async () => {
+    const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
+    const databasePath = `${stateDir}/workflows.db`;
+    createdPaths.push(stateDir);
+
+    const centralDb = createCentralDb();
+    const pollCalls: Array<{ sessionId: string; requestId: string; action: string }> = [];
+    const runtime = createWorkflowRuntime(databasePath);
+    runtime.bindPi(createWorkflowSessionBindings({
+      db: centralDb,
+      stateDir,
+      runnerDeps: {
+        async createSession() {
+          throw new Error('sendMessage remains the only host-owned binding');
+        },
+      },
+      pollForWorkflowActionResult: async ({ sessionId, requestId }) => {
+        pollCalls.push({ sessionId, requestId, action: 'skill' });
+        return {
+          type: 'workflow_action_result',
+          request_id: requestId,
+          action: 'skill',
+          status: 'completed',
+          result: 'Skill result text',
+        };
+      },
     }));
 
     runtime.registerDefinition({
@@ -1780,29 +2273,41 @@ describe('workflow runtime', () => {
         error: null,
       });
 
-      expect(captured.promptedMessages).toEqual([
-        '/skill:documentation-writer Draft a changelog entry',
-      ]);
-      expect(captured.configs).toEqual([
-        expect.objectContaining({
-          provider: 'anthropic',
-          model: 'support-model',
-        }),
-      ]);
-      expect(captured.resourceLoaders).toEqual([
-        expect.objectContaining({
-          agentDir: expect.stringContaining('/.pi-agent'),
-          additionalExtensionPaths: [],
-          noSkills: false,
-          extensionFactories: expect.any(Array),
-        }),
-      ]);
+      const session = centralDb.prepare(
+        'SELECT id, session_file FROM sessions WHERE agent_group_id = ? AND thread_id = ?',
+      ).get('support', 'workflow:skill-binding') as {
+        id: string;
+        session_file: string;
+      } | null;
+      expect(session).not.toBeNull();
+      expect(pollCalls).toEqual([{ sessionId: session!.id, requestId: expect.any(String), action: 'skill' }]);
+
+      const inboundDb = openInboundDb(session!.session_file);
+      try {
+        const configRow = inboundDb.prepare('SELECT model FROM session_config').get() as { model: string } | null;
+        expect(configRow?.model).toBe('support-model');
+        expect(inboundDb.prepare('SELECT role, content, metadata FROM messages_in ORDER BY seq ASC').all()).toEqual([
+          {
+            role: 'user',
+            content: '',
+            metadata: JSON.stringify({
+              type: 'workflow_action',
+              request_id: pollCalls[0]!.requestId,
+              action: 'skill',
+              name: 'documentation-writer',
+              input: 'Draft a changelog entry',
+            }),
+          },
+        ]);
+      } finally {
+        inboundDb.close();
+      }
     } finally {
       await runtime.stop();
     }
   });
 
-  it('surfaces runtime unavailable errors through __pi_llm when the host-owned runner cannot start', async () => {
+  it('fails __pi_prompt when the workflow action poller reports blocked', async () => {
     const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
     const databasePath = `${stateDir}/workflows.db`;
     createdPaths.push(stateDir);
@@ -1812,10 +2317,128 @@ describe('workflow runtime', () => {
     runtime.bindPi(createWorkflowSessionBindings({
       db: centralDb,
       stateDir,
-      runnerDeps: {
-        async createSession() {
-          throw new Error('Container runtime unavailable');
+      pollForWorkflowActionResult: async ({ requestId }) => ({
+        type: 'workflow_action_result',
+        request_id: requestId,
+        action: 'prompt',
+        status: 'blocked',
+        result: 'workflow blocked prompt',
+      }),
+    }));
+
+    runtime.registerDefinition({
+      name: 'prompt-blocked-workflow',
+      description: 'Calls ctx.pi.prompt when blocked should fail',
+      *generator(ctx) {
+        const response = yield ctx.pi.prompt('Summarise sales');
+        return { response };
+      },
+    });
+
+    await runtime.start();
+
+    try {
+      const started = await runtime.workflowService.startWorkflow({
+        id: 'instance-prompt-blocked',
+        name: 'prompt-blocked-workflow',
+        input: null,
+        context: {
+          trigger: 'api',
+          agent_group_id: 'support',
+          thread_id: 'workflow:prompt-blocked',
         },
+      });
+
+      await expect(runtime.workflowService.waitForWorkflow({
+        instanceId: started.instanceId,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      })).resolves.toMatchObject({
+        instanceId: 'instance-prompt-blocked',
+        name: 'prompt-blocked-workflow',
+        status: 'Failed',
+        output: null,
+        error: {
+          message: 'Workflow prompt action was blocked',
+        },
+      });
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('fails __pi_skill when the workflow action poller reports blocked', async () => {
+    const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
+    const databasePath = `${stateDir}/workflows.db`;
+    createdPaths.push(stateDir);
+
+    const centralDb = createCentralDb();
+    const runtime = createWorkflowRuntime(databasePath);
+    runtime.bindPi(createWorkflowSessionBindings({
+      db: centralDb,
+      stateDir,
+      pollForWorkflowActionResult: async ({ requestId }) => ({
+        type: 'workflow_action_result',
+        request_id: requestId,
+        action: 'skill',
+        status: 'blocked',
+        result: 'workflow blocked skill',
+      }),
+    }));
+
+    runtime.registerDefinition({
+      name: 'skill-blocked-workflow',
+      description: 'Calls ctx.pi.skill when blocked should fail',
+      *generator(ctx) {
+        const response = yield ctx.pi.skill('documentation-writer', 'Draft a changelog entry');
+        return { response };
+      },
+    });
+
+    await runtime.start();
+
+    try {
+      const started = await runtime.workflowService.startWorkflow({
+        id: 'instance-skill-blocked',
+        name: 'skill-blocked-workflow',
+        input: null,
+        context: {
+          trigger: 'api',
+          agent_group_id: 'support',
+          thread_id: 'workflow:skill-blocked',
+        },
+      });
+
+      await expect(runtime.workflowService.waitForWorkflow({
+        instanceId: started.instanceId,
+        timeoutMs: 2_000,
+        pollIntervalMs: 10,
+      })).resolves.toMatchObject({
+        instanceId: 'instance-skill-blocked',
+        name: 'skill-blocked-workflow',
+        status: 'Failed',
+        output: null,
+        error: {
+          message: 'Workflow skill action was blocked: documentation-writer',
+        },
+      });
+    } finally {
+      await runtime.stop();
+    }
+  });
+
+  it('surfaces runtime unavailable errors through __pi_llm when workflow runtime preparation cannot start', async () => {
+    const stateDir = `/tmp/cove-v2-workflows-${crypto.randomUUID()}`;
+    const databasePath = `${stateDir}/workflows.db`;
+    createdPaths.push(stateDir);
+
+    const centralDb = createCentralDb();
+    const runtime = createWorkflowRuntime(databasePath);
+    runtime.bindPi(createWorkflowSessionBindings({
+      db: centralDb,
+      stateDir,
+      ensureSessionRuntime: async () => {
+        throw new Error('Container runtime unavailable');
       },
     }));
 

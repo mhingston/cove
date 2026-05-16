@@ -1751,6 +1751,15 @@ mock.module('../src/delivery.ts', () => ({
   pollForResponse() {
     return Promise.resolve([]);
   },
+  pollForWorkflowActionResult() {
+    return Promise.resolve({
+      type: 'workflow_action_result',
+      request_id: 'unused',
+      action: 'prompt',
+      status: 'completed',
+      result: '',
+    });
+  },
 }));
 
 const { boot } = await import('../src/index.ts?scheduler-mixed-replay=' + ${JSON.stringify(crypto.randomUUID())});
@@ -1949,6 +1958,15 @@ mock.module('../src/delivery.ts', () => ({
   pollForResponse() {
     return Promise.resolve([]);
   },
+  pollForWorkflowActionResult() {
+    return Promise.resolve({
+      type: 'workflow_action_result',
+      request_id: 'unused',
+      action: 'prompt',
+      status: 'completed',
+      result: '',
+    });
+  },
 }));
 
 const { boot } = await import('../src/index.ts?scheduler-null-model=' + ${JSON.stringify(crypto.randomUUID())});
@@ -2131,6 +2149,15 @@ mock.module('../src/delivery.ts', () => ({
   DeliveryTimeoutError: class DeliveryTimeoutError extends Error {},
   pollForResponse() {
     return Promise.resolve([]);
+  },
+  pollForWorkflowActionResult() {
+    return Promise.resolve({
+      type: 'workflow_action_result',
+      request_id: 'unused',
+      action: 'prompt',
+      status: 'completed',
+      result: '',
+    });
   },
 }));
 
