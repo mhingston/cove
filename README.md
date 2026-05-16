@@ -309,7 +309,7 @@ COVE_LIVE_E2E=1 GH_TOKEN="$(gh auth token)" COVE_LIVE_MODEL="github-copilot/gpt-
 
 The first command proves skip behavior. The second runs a real local end-to-end chat against a live provider path.
 
-See `docs/testing.md` for the full testing guide.
+See [the testing guide](docs/testing.md) for the full testing guide.
 
 ## Key Environment Variables
 
@@ -322,6 +322,6 @@ See `docs/testing.md` for the full testing guide.
 
 ## Further Reading
 
-- `docs/architecture.md`: runtime design, state layout, warm pool, and delivery verification.
-- `docs/api.md`: route-by-route reference.
-- `docs/testing.md`: deterministic verification, coverage gate, and live E2E details.
+- [Architecture](docs/architecture.md): runtime design, state layout, warm pool, and delivery verification.
+- [API Reference](docs/api.md): route-by-route reference.
+- [Testing](docs/testing.md): deterministic verification, coverage gate, and live E2E details.
