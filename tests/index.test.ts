@@ -1047,7 +1047,7 @@ describe('boot sequence', () => {
     expect(log).toContain('run');
     expect(log).toContain('--name');
     expect(log).toContain('cove-agent:test');
-    expect(log).toContain(path.join(stateDir, 'cove.db') + ':/app/session/cove.db');
+    expect(log).toContain(path.join(stateDir, 'cove.db') + ':/app/cove.db');
   });
 
   it('uses warm-pool size defaults of 1 and 5 when pool env vars are unset', async () => {

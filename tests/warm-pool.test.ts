@@ -99,7 +99,7 @@ describe('warm pool', () => {
         expect(row.model).toBeNull();
         expect(JSON.parse(row.extra_env ?? '{}')).toMatchObject({
           COVE_SESSION_ID: capturedSessionId!,
-          COVE_CENTRAL_DB_PATH: path.join(stateDir, 'cove.db'),
+          COVE_CENTRAL_DB_PATH: '/app/cove.db',
         });
       } finally {
         db.close();

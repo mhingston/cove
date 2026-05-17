@@ -58,7 +58,7 @@ function seedWarmSessionConfig(sessionDir: string, sessionId: string, centralDbP
       null,
       JSON.stringify({
         COVE_SESSION_ID: sessionId,
-        ...(centralDbPath == null ? {} : { COVE_CENTRAL_DB_PATH: centralDbPath }),
+        ...(centralDbPath == null ? {} : { COVE_CENTRAL_DB_PATH: '/app/cove.db' }),
       }),
       null,
     );

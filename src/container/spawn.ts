@@ -234,7 +234,7 @@ function resolveContainerRuntimeOptions(
   envVars.PI_CODING_AGENT_DIR = '/app/session/.pi-agent';
 
   if (options.centralDbPath != null) {
-    envVars.COVE_CENTRAL_DB_PATH = '/app/session/cove.db';
+    envVars.COVE_CENTRAL_DB_PATH = '/app/cove.db';
   }
 
   const hostPiAgentDir = resolveHostPiAgentDir(env);
@@ -351,7 +351,7 @@ export function buildContainerArgs(options: ContainerStartOptions): string[] {
   args.push('-v', `${resolvedOptions.sessionDir}:/app/session`);
 
   if (resolvedOptions.centralDbPath != null) {
-    args.push('-v', `${resolvedOptions.centralDbPath}:/app/session/cove.db`);
+    args.push('-v', `${resolvedOptions.centralDbPath}:/app/cove.db`);
   }
 
   if (resolvedOptions.workspaceDir != null) {

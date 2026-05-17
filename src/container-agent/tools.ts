@@ -80,21 +80,11 @@ function openCentralDb(runtime?: CoveToolRuntimeOptions): Database | null {
     return null;
   }
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      return new SqliteDatabase(dbPath);
-    } catch {
-      if (attempt < 4) {
-        const delayMs = 100 * 2 ** attempt;
-        const start = Date.now();
-        while (Date.now() - start < delayMs) {
-          // busy-wait sync sleep
-        }
-      }
-    }
+  try {
+    return new SqliteDatabase(dbPath);
+  } catch {
+    return null;
   }
-
-  return null;
 }
 
 function createSearchMemoriesTool(

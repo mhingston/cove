@@ -102,13 +102,13 @@ describe('container manager', () => {
     expect(args.at(-1)).toBe('cove-agent:latest');
   });
 
-  it('buildContainerArgs mounts the central db inside the session boundary when provided', () => {
+  it('buildContainerArgs mounts the central db at a separate path from the session directory', () => {
     const args = buildContainerArgs({
       ...baseOptions,
       centralDbPath: '/tmp/cove-state/cove.db',
     });
 
-    expect(args).toContain('/tmp/cove-state/cove.db:/app/session/cove.db');
+    expect(args).toContain('/tmp/cove-state/cove.db:/app/cove.db');
   });
 
   it('buildContainerArgs exports the mounted central db path to the container runtime', () => {
@@ -117,7 +117,7 @@ describe('container manager', () => {
       centralDbPath: '/tmp/cove-state/cove.db',
     });
 
-    expect(args).toContain('COVE_CENTRAL_DB_PATH=/app/session/cove.db');
+    expect(args).toContain('COVE_CENTRAL_DB_PATH=/app/cove.db');
   });
 
   it('buildContainerArgs injects only allowlisted OneCLI gateway env from the host', () => {
