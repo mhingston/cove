@@ -73,14 +73,18 @@ function resolveCentralDbPath(runtime?: CoveToolRuntimeOptions): string | undefi
   return runtime?.centralDbPath ?? process.env.COVE_CENTRAL_DB_PATH;
 }
 
-function openCentralDb(runtime?: CoveToolRuntimeOptions): Database {
+function openCentralDb(runtime?: CoveToolRuntimeOptions): Database | null {
   const dbPath = resolveCentralDbPath(runtime);
 
   if (!dbPath) {
-    throw new Error('COVE_CENTRAL_DB_PATH is required for live container tools');
+    return null;
   }
 
-  return new SqliteDatabase(dbPath);
+  try {
+    return new SqliteDatabase(dbPath);
+  } catch {
+    return null;
+  }
 }
 
 function createSearchMemoriesTool(
@@ -444,6 +448,10 @@ export function createCoveTools(db?: Database, embedTexts?: EmbedTexts, runtime?
   }
 
   const toolDb = db ?? openCentralDb(runtime);
+
+  if (toolDb == null) {
+    return tools;
+  }
 
   return [
     ...tools,
