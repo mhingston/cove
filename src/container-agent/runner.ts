@@ -1336,7 +1336,8 @@ function buildResourceLoader(options: {
   const oneCliExtensionPackageDir = gatewayAuth.isEnabled && gatewayAuth.isSupported && gatewayAuth.hasInheritedGatewayEnv
     ? options.resolveInstalledPackageDir('pi-onecli-extension')
     : undefined;
-  const additionalExtensionPaths = [subagentPackageDir, leanCtxExtensionPackageDir, sessionOverlayAgentDir.packageDir, oneCliExtensionPackageDir]
+  const coveExtensionPackageDir = path.join(sessionOverlayAgentDir.packageDir, '..', '..', '..', 'node_modules', '@cove', 'pi-cove-extension');
+  const additionalExtensionPaths = [subagentPackageDir, leanCtxExtensionPackageDir, sessionOverlayAgentDir.packageDir, oneCliExtensionPackageDir, coveExtensionPackageDir]
     .filter((value): value is string => value != null);
   const persona = agentGroupId == null || centralDbPath == null
     ? undefined

@@ -1,0 +1,24 @@
+{
+  "name": "@mhingston5/pi-cove-extension",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Cove runtime integration for pi agents",
+  "keywords": ["pi-package", "pi-extension", "cove"],
+  "license": "MIT",
+  "files": ["index.ts", "README.md", "LICENSE"],
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "node --check /dev/null",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
