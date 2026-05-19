@@ -22,6 +22,7 @@ import {
 } from '../session/outbound.ts';
 import { createCoveTools, type ToolDefinition } from './tools.ts';
 import { resolveContainerAgentModel, setupContainerAgent } from './agent-setup.ts';
+import { registerNineRouterProvider, isNineRouterProvider } from '../providers/9router.ts';
 import type { EmbedTexts } from '../context/external.ts';
 
 type PermissionTier = 'auto' | 'prompt' | 'confirm';
@@ -125,6 +126,23 @@ type CodingAgentSdkModule = {
       setRuntimeApiKey(provider: string, apiKey: string): void;
     }): {
       find(provider: string, model: string): unknown;
+      registerProvider(providerName: string, config: {
+        name?: string;
+        baseUrl?: string;
+        apiKey?: string;
+        api?: string;
+        authHeader?: boolean;
+        models?: Array<{
+          id: string;
+          name: string;
+          api?: string;
+          reasoning: boolean;
+          input: ('text' | 'image')[];
+          cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+          contextWindow: number;
+          maxTokens: number;
+        }>;
+      }): void;
     };
   };
   SessionManager: {
@@ -1274,6 +1292,12 @@ async function createDefaultSession(options: CreateSessionOptions): Promise<Runn
 
       const modelRegistry = sdk.ModelRegistry.inMemory(authStorage);
       setupModelRegistry = modelRegistry;
+
+      if (isNineRouterProvider(input.provider)) {
+        const apiKey = getRunnerApiKey(options.config) ?? 'dummy-key-for-header';
+        registerNineRouterProvider(modelRegistry, apiKey);
+      }
+
       return modelRegistry.find(input.provider, input.model);
     },
     async createSessionManager(input) {
