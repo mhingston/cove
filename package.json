@@ -17,7 +17,8 @@
     "duroxide": "^0.1.26",
     "pi-lean-ctx": "^3.6.0",
     "pi-duroxide": "^0.1.0",
-    "pi-onecli-extension": "*"
+    "pi-onecli-extension": "*",
+    "@mhingston5/pi-cove-extension": "^0.1.0"
   },
   "devDependencies": {
     "@types/bun": "latest",

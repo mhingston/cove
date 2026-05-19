@@ -22,8 +22,6 @@ COPY bun.lock ./bun.lock
 
 RUN bun install --frozen-lockfile
 
-COPY extensions/ ./extensions/
-RUN mkdir -p node_modules/@cove && mv extensions/pi-cove-extension node_modules/@cove/pi-cove-extension
 COPY src/ ./src/
 
 RUN mkdir -p /workspace && chmod 777 /workspace
