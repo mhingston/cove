@@ -22,16 +22,44 @@ function supportsOneCliGateway(provider: string | null): boolean {
   return provider === 'anthropic' || provider === 'auto';
 }
 
+function getOneCliGatewayProxyUrl(): string | null {
+  const url = process.env.ONECLI_URL?.trim();
+  if (!url) {
+    return null;
+  }
+  try {
+    const parsed = new URL(url);
+    if (parsed.port === '10255') {
+      return `${parsed.host}`;
+    }
+    return `${parsed.host}:10255`;
+  } catch {
+    return null;
+  }
+}
+
 export function buildAgentGroupSessionConfig(agentGroup: Pick<AgentGroupRow, 'provider' | 'model' | 'thinking' | 'workspace' | 'permissions' | 'config'>): SessionConfig {
   const parsedConfig = parseRuntimePrepConfigValue(agentGroup.config) ?? {};
   const mcpConfig = serializeRuntimeMcpConfig(resolveRuntimeMcpConfig(parsedConfig)) ?? null;
-  const extraEnv = {
+  const extraEnv: Record<string, string> = {
     ...(parsedConfig.extra_env ?? {}),
     ...(parsedConfig.credential_profile == null ? {} : { credential_profile: parsedConfig.credential_profile }),
     ...(mcpConfig == null ? {} : { COVE_MCP_CONFIG: mcpConfig }),
   };
 
   const useOneCliGateway = isOneCliAuthEnabled(parsedConfig.extra_env) && hasOneCliGatewayEnv();
+
+  if (useOneCliGateway && !supportsOneCliGateway(agentGroup.provider)) {
+    const proxyUrl = getOneCliGatewayProxyUrl();
+    if (proxyUrl) {
+      extraEnv.HTTPS_PROXY = proxyUrl;
+      extraEnv.https_proxy = proxyUrl;
+      extraEnv.HTTP_PROXY = proxyUrl;
+      extraEnv.http_proxy = proxyUrl;
+      extraEnv.NO_PROXY = 'localhost,127.0.0.1';
+      extraEnv.no_proxy = 'localhost,127.0.0.1';
+    }
+  }
 
   return {
     provider: agentGroup.provider,

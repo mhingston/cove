@@ -37,7 +37,11 @@ type EnsureSessionRuntimeDeps = {
 };
 
 function requiresColdSpawn(config: SessionConfig, runtimePrep: RuntimePrepConfig): boolean {
+  const hasOneCliProxy = (config.extra_env?.HTTPS_PROXY ?? config.extra_env?.https_proxy ?? '') !== ''
+    || (config.extra_env?.HTTP_PROXY ?? config.extra_env?.http_proxy ?? '') !== '';
+
   return config.workspace != null
+    || hasOneCliProxy
     || (runtimePrep.provider_env_passthrough?.length ?? 0) > 0
     || (runtimePrep.provider_file_env_passthrough?.length ?? 0) > 0;
 }
