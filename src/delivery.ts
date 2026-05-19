@@ -158,8 +158,8 @@ export async function pollForResponse(options: {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 } & DeliveryDbReader): Promise<OutboundMessageRow[]> {
-  const timeoutMs = options.timeoutMs ?? 10_000;
-  const pollIntervalMs = options.pollIntervalMs ?? 25;
+  const timeoutMs = options.timeoutMs ?? 120_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 250;
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
 
@@ -198,8 +198,8 @@ export async function pollForWorkflowActionResult(options: {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 } & DeliveryDbReader): Promise<WorkflowActionResultMetadata> {
-  const timeoutMs = options.timeoutMs ?? 10_000;
-  const pollIntervalMs = options.pollIntervalMs ?? 25;
+  const timeoutMs = options.timeoutMs ?? 120_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 250;
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
   const baselineOutSeq = options.baselineOutSeq ?? 0;

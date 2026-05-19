@@ -5,7 +5,7 @@ import { getImageName } from './container/image.ts';
 import { killContainer } from './container/kill.ts';
 import { getActiveContainers } from './container/spawn.ts';
 import { openInboundDb } from './session/inbound.ts';
-import { openOutboundDb, readProcessingAck } from './session/outbound.ts';
+import { openExistingOutboundDb, readProcessingAck } from './session/outbound.ts';
 import type { WarmPool } from './shared/types.ts';
 
 type WarmPoolOptions = {
@@ -74,7 +74,7 @@ function isReady(entry: WarmPoolEntry): boolean {
     return false;
   }
 
-  const outboundDb = openOutboundDb(entry.sessionDir);
+  const outboundDb = openExistingOutboundDb(entry.sessionDir);
 
   try {
     return readProcessingAck(outboundDb, entry.sessionId) != null;

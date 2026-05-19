@@ -15,7 +15,7 @@ export function openInboundDb(sessionDir: string): Database {
   fs.mkdirSync(sessionDir, { recursive: true });
 
   const db = new Database(getInboundDbPath(sessionDir));
-  db.exec('PRAGMA journal_mode = DELETE');
+  db.exec('PRAGMA journal_mode = WAL');
   db.exec(`
     CREATE TABLE IF NOT EXISTS messages_in (
       id         TEXT PRIMARY KEY,
