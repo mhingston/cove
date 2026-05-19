@@ -10,6 +10,11 @@ RUN curl -fsSL https://leanctx.com/install.sh | sh \
   && mv /root/.local/bin/lean-ctx /usr/local/bin/lean-ctx \
   && lean-ctx init bash >> /root/.bashrc
 
+# Install OneCLI for credential-injected API access
+RUN curl -fsSL https://www.onecli.sh/cli/install | sh \
+  && find /root -name "onecli" -type f -exec mv {} /usr/local/bin/onecli \; 2>/dev/null \
+  || (ls -la /root/.local/bin/ 2>/dev/null && find / -name "onecli" -type f 2>/dev/null)
+
 WORKDIR /app
 
 COPY package.json ./package.json

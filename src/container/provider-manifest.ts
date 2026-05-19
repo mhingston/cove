@@ -42,4 +42,5 @@ export const BUILT_IN_PROVIDER_FILE_ENV_PASSTHROUGH = [
 export const BUILT_IN_PROVIDER_CREDENTIAL_DIR_MOUNTS = [
   { relativeHostPath: '.aws', containerPath: '/root/.aws' },
   { relativeHostPath: '.config/gcloud', containerPath: '/root/.config/gcloud' },
+  { relativeHostPath: '.onecli', containerPath: '/root/.onecli' },
 ] as const satisfies readonly ProviderCredentialDirMount[];

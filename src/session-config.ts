@@ -18,6 +18,10 @@ function hasOneCliGatewayEnv(): boolean {
     && (process.env.ONECLI_URL?.trim() ?? '') !== '';
 }
 
+function supportsOneCliGateway(provider: string | null): boolean {
+  return provider === 'anthropic' || provider === 'auto';
+}
+
 export function buildAgentGroupSessionConfig(agentGroup: Pick<AgentGroupRow, 'provider' | 'model' | 'thinking' | 'workspace' | 'permissions' | 'config'>): SessionConfig {
   const parsedConfig = parseRuntimePrepConfigValue(agentGroup.config) ?? {};
   const mcpConfig = serializeRuntimeMcpConfig(resolveRuntimeMcpConfig(parsedConfig)) ?? null;
@@ -27,11 +31,13 @@ export function buildAgentGroupSessionConfig(agentGroup: Pick<AgentGroupRow, 'pr
     ...(mcpConfig == null ? {} : { COVE_MCP_CONFIG: mcpConfig }),
   };
 
+  const useOneCliGateway = isOneCliAuthEnabled(parsedConfig.extra_env) && hasOneCliGatewayEnv();
+
   return {
     provider: agentGroup.provider,
     model: agentGroup.model,
     thinking_level: agentGroup.thinking,
-    api_key: isOneCliAuthEnabled(parsedConfig.extra_env) && hasOneCliGatewayEnv() ? null : parsedConfig.api_key ?? null,
+    api_key: useOneCliGateway && supportsOneCliGateway(agentGroup.provider) ? null : parsedConfig.api_key ?? null,
     workspace: agentGroup.workspace,
     extra_env: Object.keys(extraEnv).length > 0 ? extraEnv : null,
     permissions: agentGroup.permissions,
