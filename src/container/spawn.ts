@@ -246,6 +246,15 @@ function resolveContainerRuntimeOptions(
     });
   }
 
+  const devSrc = env.COVE_DEV_SRC?.trim();
+  if (devSrc && fs.existsSync(devSrc)) {
+    addMount(mounts, {
+      hostPath: devSrc,
+      containerPath: '/app/src',
+      readOnly: true,
+    });
+  }
+
   const homeDir = resolveHomeDir(env);
   for (const mount of BUILT_IN_PROVIDER_CREDENTIAL_DIR_MOUNTS) {
     const hostPath = path.join(homeDir, mount.relativeHostPath);

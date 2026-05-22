@@ -437,6 +437,10 @@ function validateRunnerCredentials(config: SessionConfig): void {
     return;
   }
 
+  if (isNineRouterProvider(config.provider)) {
+    return;
+  }
+
   const resolvedModel = resolveContainerAgentModel({
     provider: config.provider,
     model: config.model,
@@ -1295,7 +1299,10 @@ async function createDefaultSession(options: CreateSessionOptions): Promise<Runn
 
       if (isNineRouterProvider(input.provider)) {
         const apiKey = getRunnerApiKey(options.config) ?? 'dummy-key-for-header';
-        registerNineRouterProvider(modelRegistry, apiKey);
+        const baseUrl = process.env.NINE_ROUTER_BASE_URL
+          ?? options.config.extra_env?.NINE_ROUTER_BASE_URL
+          ?? undefined;
+        registerNineRouterProvider(modelRegistry, apiKey, baseUrl);
       }
 
       return modelRegistry.find(input.provider, input.model);

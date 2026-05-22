@@ -143,6 +143,12 @@ function buildSessionConfig(routed: ReturnType<typeof routeRequest>, requestBody
   const centralDbPath = typeof process.env.COVE_STATE_DIR === 'string' && process.env.COVE_STATE_DIR.trim() !== ''
     ? `${process.env.COVE_STATE_DIR}/cove.db`
     : null;
+
+  const modelUsedForRouting = explicitModelOverride != null
+    && explicitModelOverride === routed.agentGroup.id;
+  const effectiveModel = modelUsedForRouting ? base.model : (explicitModelOverride ?? base.model);
+  const effectiveProvider = modelUsedForRouting ? base.provider : (explicitProvider ?? base.provider);
+
   const extraEnv = {
     ...(base.extra_env ?? {}),
     COVE_SESSION_ID: routed.session.id,
@@ -152,8 +158,8 @@ function buildSessionConfig(routed: ReturnType<typeof routeRequest>, requestBody
 
   return {
     ...base,
-    provider: explicitProvider ?? base.provider,
-    model: explicitModelOverride ?? base.model,
+    provider: effectiveProvider,
+    model: effectiveModel,
     extra_env: Object.keys(extraEnv).length > 0 ? extraEnv : null,
   };
 }
