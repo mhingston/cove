@@ -312,11 +312,61 @@ export async function handleChatCompletion(request: Request, context: AppContext
   }
 
   if (body.stream === true) {
-    return createStreamingResponse(buildStreamingSource(streamTokens, {
-      routed,
-      config: sessionConfig,
-      messages: body.messages,
-    }));
+    const sessionDir = routed.session.session_file;
+
+    if (sessionDir == null) {
+      return jsonError('Session runtime is unavailable', 503);
+    }
+
+    const outboundBaselineDb = openExistingOutboundDb(sessionDir);
+    let baselineSeq = 0;
+
+    try {
+      const baselineRow = outboundBaselineDb.prepare('SELECT MAX(seq) AS seq FROM messages_out').get() as {
+        seq: number | null;
+      };
+      baselineSeq = baselineRow.seq ?? 0;
+    } finally {
+      outboundBaselineDb.close();
+    }
+
+    const inboundDb = openInboundDb(sessionDir);
+
+    try {
+      writeSessionConfig(inboundDb, sessionConfig);
+      materializeTranscriptContext(sessionDir, routed.session.id, body.messages);
+      appendNewExecutableTurns(inboundDb, body.messages);
+    } finally {
+      inboundDb.close();
+    }
+
+    return createStreamingResponse((async function* () {
+      try {
+        const messages = await pollForResponseImpl({
+          openDb: () => openExistingOutboundDb(sessionDir),
+          sessionId: routed.session.id,
+          baselineOutSeq: baselineSeq,
+        });
+
+        for (const message of messages) {
+          yield sseEvent(JSON.stringify({
+            choices: [{ delta: { content: message.content }, index: 0 }],
+          }));
+        }
+
+        yield sseEvent('[DONE]');
+      } catch (error) {
+        if (error instanceof DeliveryTimeoutError) {
+          yield sseEvent(JSON.stringify({
+            error: 'Delivery verification timed out before response integrity was confirmed',
+          }));
+          yield sseEvent('[DONE]');
+          return;
+        }
+
+        throw error;
+      }
+    })());
   }
 
   const sessionDir = routed.session.session_file;

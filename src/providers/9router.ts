@@ -108,6 +108,15 @@ const NINE_ROUTER_MODELS: NineRouterProviderModels[] = [
     contextWindow: 128000,
     maxTokens: 16384,
   },
+  {
+    id: 'azure/DeepSeek-V4-Flash',
+    name: 'DeepSeek V4 Flash (Azure)',
+    reasoning: false,
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128000,
+    maxTokens: 16384,
+  },
 ];
 
 export function registerNineRouterProvider(
